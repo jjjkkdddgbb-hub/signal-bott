@@ -14,6 +14,7 @@ from app import app as web_app
 from quotex_manager import copy_manager
 from database import get_setting, set_setting, get_secret_setting
 from notify import send_telegram_text, telegram_configured
+import strategies
 
 NUM_PAIRS = 15
 TRADE_DURATION_MIN = 1
@@ -24,7 +25,13 @@ EMA_SLOW = 21
 MIN_PAYOUT = 60
 CANDLE_HISTORY_SECONDS = 10800
 MIN_STRENGTH = 12
-RECONNECT_AFTER_CYCLES = 30
+RECONNECT_AFTER_SEC = 30 * 60      # نعيد الاتصال كل 30 دقيقة لتجنب انقطاع صامت
+SCAN_PAIRS = 8                    # عدد الأزواج التي تفحصها الاستراتيجيات الجديدة
+SCAN_HISTORY_SECONDS = 4800       # 80 شمعة كافية لمؤشرات الاستراتيجيات
+ASSETS_TTL_SEC = 300              # نخزّن قائمة الأزواج المفتوحة 5 دقائق
+STRATEGY_COOLDOWN_SEC = 60        # أقل فاصل بين إشارتين لنفس الاستراتيجية
+ASSET_COOLDOWN_SEC = 180          # لا نكرر نفس الزوج لنفس الاستراتيجية قبل 3 دقائق
+SCAN_BUDGET_SEC = 40              # حد أقصى لزمن الفحص حتى لا تتأخر الدخولات
 
 PLATFORM_LINK = "https://broker-qx.pro/sign-up/?lid=2384798"
 CHANNEL_LINK = 'قناة أوسكار 🔥'
@@ -247,6 +254,57 @@ async def get_top_open_assets(client, n=NUM_PAIRS, min_payout=MIN_PAYOUT):
     return candidates[:n]
 
 
+async def fetch_raw(client, asset, seconds):
+    try:
+        return await asyncio.wait_for(
+            client.get_historical_candles(asset, amount_of_seconds=seconds, period=60, max_workers=3),
+            timeout=15
+        )
+    except Exception:
+        try:
+            return await asyncio.wait_for(
+                client.get_candles(asset, int(time.time()), seconds, 60),
+                timeout=15
+            )
+        except Exception:
+            return []
+
+
+async def scan_strategies(client, assets, scan_ids, last_fire, last_asset_fire):
+    """يفحص الأزواج مرة واحدة ويطلق أقوى إشارة لكل استراتيجية لها مستخدمون."""
+    started = time.time()
+    best = {}
+    scanned = 0
+    for name, payout in assets[:SCAN_PAIRS]:
+        if time.time() - started > SCAN_BUDGET_SEC:
+            break
+        raw = await fetch_raw(client, name, SCAN_HISTORY_SECONDS)
+        candles = strategies.parse_ohlc(raw)
+        scanned += 1
+        for sid in scan_ids:
+            if time.time() - last_asset_fire.get((sid, name), 0) < ASSET_COOLDOWN_SEC:
+                continue
+            res = strategies.evaluate(sid, candles)
+            if res and (sid not in best or res["score"] > best[sid][1]["score"]):
+                best[sid] = (name, res)
+
+    fired = 0
+    for sid, (name, res) in best.items():
+        if time.time() - last_fire.get(sid, 0) < STRATEGY_COOLDOWN_SEC:
+            continue
+        last_fire[sid] = time.time()
+        last_asset_fire[(sid, name)] = time.time()
+        copy_manager.submit(copy_manager.broadcast_signal(
+            name, res["dir"], strategies.EXPIRY_SECONDS, 0, strategy=sid
+        ))
+        arrow = "صعود" if res["dir"] == "call" else "هبوط"
+        report(f"last_signal_{sid}", f"{name} — {arrow} — {res['why']}")
+        report(f"last_signal_{sid}_at", datetime.utcnow().isoformat(timespec="seconds"))
+        print(f"[SCAN] {sid}: {name} {res['dir']} score={res['score']:.1f} ({res['why']})", flush=True)
+        fired += 1
+    print(f"[SCAN] scanned={scanned} strategies={scan_ids} fired={fired} in {time.time() - started:.1f}s", flush=True)
+
+
 async def get_closes(client, asset):
     try:
         candles = await asyncio.wait_for(
@@ -294,7 +352,11 @@ async def main_loop():
     client = None
     cycle = 0
     consecutive_failures = 0
-    cycles_with_client = 0
+    connected_at = 0.0
+    next_bot_at = 0.0
+    assets_cache = ([], 0.0)
+    last_fire, last_asset_fire = {}, {}
+    last_scan_minute = -1
 
     while True:
         try:
@@ -305,11 +367,21 @@ async def main_loop():
                 await asyncio.sleep(min(blocked + 5, 600))
                 continue
 
-            if client is not None and cycles_with_client >= RECONNECT_AFTER_CYCLES:
-                print(f"[BOT] forcing reconnect after {cycles_with_client} cycles", flush=True)
+            if client is not None and time.time() - connected_at >= RECONNECT_AFTER_SEC:
+                print("[BOT] periodic reconnect", flush=True)
                 await close_client(client)
                 client = None
-                cycles_with_client = 0
+
+            # هل هناك عمل مطلوب الآن؟ (لا نتصل بـ Quotex إن لم يكن هناك داعٍ)
+            auto_on = safe_setting("admin_auto_enabled", "1") == "1"
+            subs = copy_manager.strategy_subscribers() if auto_on else {}
+            scan_ids = [sid for sid in strategies.SCAN_IDS if subs.get(sid) and strategies.is_enabled(sid)]
+            bot_due = time.time() >= next_bot_at
+
+            if not bot_due and not scan_ids:
+                set_status("يعمل — بانتظار الإشارة التالية")
+                await asyncio.sleep(min(10, max(1, next_bot_at - time.time())))
+                continue
 
             if client is None:
                 _ck, _ss = load_master_session()
@@ -332,52 +404,68 @@ async def main_loop():
                     await asyncio.sleep(wait_s)
                     continue
                 consecutive_failures = 0
-                cycles_with_client = 0
+                connected_at = time.time()
                 copy_manager.note_connect_ok()
 
-            cycles_with_client += 1
-            cycle += 1
-            set_status(f"يعمل — الدورة {cycle}، يبحث عن إشارة")
+            # قائمة الأزواج المفتوحة (مخزنة 5 دقائق)
+            if not assets_cache[0] or time.time() - assets_cache[1] > ASSETS_TTL_SEC:
+                set_status("يفحص الأزواج المفتوحة…")
+                top_assets = await get_top_open_assets(client)
+                if not top_assets:
+                    print("[BOT] no candidates - reconnect next cycle", flush=True)
+                    await close_client(client)
+                    client = None
+                    assets_cache = ([], 0.0)
+                    await asyncio.sleep(LEAD_TIME_SEC * 2)
+                    continue
+                assets_cache = (top_assets, time.time())
+            top_assets = assets_cache[0]
 
-            top_assets = await get_top_open_assets(client)
-            if not top_assets:
-                print("[BOT] no candidates - reconnect next cycle", flush=True)
-                await close_client(client)
-                client = None
-                await asyncio.sleep(LEAD_TIME_SEC * 2)
-                continue
+            # ───── 1) صفقات البوت (إشارة تيليجرام + تنفيذ بعد دقيقة) ─────
+            if bot_due:
+                cycle += 1
+                set_status(f"يعمل — الدورة {cycle}، يبحث عن إشارة")
+                best = await pick_best_signal(client, top_assets)
+                if best is None:
+                    set_status("يعمل — لا توجد إشارة قوية في هذه الدورة")
+                    next_bot_at = time.time() + LEAD_TIME_SEC
+                else:
+                    asset, payout, strength, direction = best
+                    print(f"[BOT] SIGNAL: {asset} {direction} strength={strength:.2f} payout={payout}", flush=True)
 
-            best = await pick_best_signal(client, top_assets)
-            if best is None:
-                set_status("يعمل — لا توجد إشارة قوية في هذه الدورة")
-                await asyncio.sleep(LEAD_TIME_SEC)
-                continue
+                    entry_time = (datetime.now() + timedelta(seconds=LEAD_TIME_SEC)).strftime("%H:%M")
+                    sent = False
+                    if safe_setting("admin_bot_enabled", "1") == "1":
+                        sent = send_telegram(asset, direction, entry_time, TRADE_DURATION_MIN)
+                    else:
+                        print("[BOT] telegram disabled by admin", flush=True)
 
-            asset, payout, strength, direction = best
-            print(f"[BOT] SIGNAL: {asset} {direction} strength={strength:.2f} payout={payout}", flush=True)
+                    if auto_on and strategies.is_enabled("bot"):
+                        trade_dir = "call" if direction == "up" else "put"
+                        copy_manager.submit(copy_manager.broadcast_signal(
+                            asset, trade_dir, TRADE_DURATION_MIN * 60, LEAD_TIME_SEC, strategy="bot"
+                        ))
+                    else:
+                        print("[BOT] auto trading disabled by admin", flush=True)
 
-            entry_time = (datetime.now() + timedelta(seconds=LEAD_TIME_SEC)).strftime("%H:%M")
-            sent = False
+                    arrow = "صعود" if direction == "up" else "هبوط"
+                    report("last_signal", f"{asset} — {arrow} — {'أُرسلت لتيليجرام' if sent else 'لم تُرسل لتيليجرام'}")
+                    report("last_signal_at", datetime.utcnow().isoformat(timespec="seconds"))
+                    next_bot_at = time.time() + TRADE_DURATION_MIN * 60 + LEAD_TIME_SEC
 
-            if safe_setting("admin_bot_enabled", "1") == "1":
-                sent = send_telegram(asset, direction, entry_time, TRADE_DURATION_MIN)
+            # ───── 2) الاستراتيجيات الجديدة (فحص مرة كل شمعة جديدة) ─────
+            if scan_ids:
+                sec = time.time() % 60
+                minute = int(time.time() // 60)
+                if minute == last_scan_minute or not (2 <= sec <= 28):
+                    wait = (62 - sec) % 60 if minute == last_scan_minute or sec > 28 else 2 - sec
+                    await asyncio.sleep(max(1, min(wait, 60)))
+                if int(time.time() // 60) != last_scan_minute:
+                    last_scan_minute = int(time.time() // 60)
+                    set_status(f"يفحص الاستراتيجيات ({len(scan_ids)}) على {min(len(top_assets), SCAN_PAIRS)} أزواج")
+                    await scan_strategies(client, top_assets, scan_ids, last_fire, last_asset_fire)
             else:
-                print("[BOT] telegram disabled by admin", flush=True)
-
-            if safe_setting("admin_auto_enabled", "1") == "1":
-                trade_dir = "call" if direction == "up" else "put"
-                copy_manager.submit(copy_manager.broadcast_signal(
-                    asset, trade_dir, TRADE_DURATION_MIN * 60, LEAD_TIME_SEC
-                ))
-            else:
-                print("[BOT] auto trading disabled by admin", flush=True)
-
-            arrow = "صعود" if direction == "up" else "هبوط"
-            report("last_signal", f"{asset} — {arrow} — {'أُرسلت لتيليجرام' if sent else 'لم تُرسل لتيليجرام'}")
-            report("last_signal_at", datetime.utcnow().isoformat(timespec="seconds"))
-
-            wait_seconds = (TRADE_DURATION_MIN * 60) + LEAD_TIME_SEC
-            await asyncio.sleep(wait_seconds)
+                await asyncio.sleep(2)
 
         except Exception as e:
             consecutive_failures += 1
@@ -385,6 +473,7 @@ async def main_loop():
             set_status(f"خطأ غير متوقع ({str(e)[:80]}) — إعادة المحاولة بعد {wait_s // 60} دقيقة")
             await close_client(client)
             client = None
+            assets_cache = ([], 0.0)
             await asyncio.sleep(wait_s)
 
 

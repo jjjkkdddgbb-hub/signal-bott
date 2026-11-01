@@ -505,16 +505,42 @@ class QuotexCopyManager:
         conn.close()
         return [dict(r) for r in rows]
 
-    def _active_auto_traders(self):
-        conn = get_db()
-        rows = conn.execute(
+    def _active_auto_traders(self, strategy=None):
+        sql = (
             "SELECT u.* FROM users u JOIN licenses l ON l.key = u.license_key "
             "WHERE u.is_auto_trading = 1 AND u.quotex_ssid IS NOT NULL AND u.quotex_ssid != '' "
-            "AND l.is_active = 1 AND (l.expires_at IS NULL OR l.expires_at > ?)",
-            (now_iso(),),
-        ).fetchall()
+            "AND l.is_active = 1 AND (l.expires_at IS NULL OR l.expires_at > ?)"
+        )
+        params = [now_iso()]
+        if strategy:
+            if strategy == "bot":
+                sql += " AND (u.strategy IS NULL OR u.strategy = '' OR u.strategy = 'bot')"
+            else:
+                sql += " AND u.strategy = ?"
+                params.append(strategy)
+        conn = get_db()
+        rows = conn.execute(sql, tuple(params)).fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    def strategy_subscribers(self):
+        """عدد المستخدمين النشطين لكل استراتيجية (للماسح كي لا يعمل بلا داعٍ)."""
+        counts = {}
+        try:
+            conn = get_db()
+            rows = conn.execute(
+                "SELECT COALESCE(NULLIF(u.strategy, ''), 'bot') AS s, COUNT(*) AS c "
+                "FROM users u JOIN licenses l ON l.key = u.license_key "
+                "WHERE u.is_auto_trading = 1 AND u.quotex_ssid IS NOT NULL AND u.quotex_ssid != '' "
+                "AND l.is_active = 1 AND (l.expires_at IS NULL OR l.expires_at > ?) GROUP BY s",
+                (now_iso(),),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                counts[r["s"]] = r["c"]
+        except Exception as e:
+            print(f"[STRATEGY] subscribers error: {e}", flush=True)
+        return counts
 
     def _log_trade(self, asset, direction, amount, expiry, order_id, count):
         conn = get_db()
@@ -572,19 +598,22 @@ class QuotexCopyManager:
             return {"success": True, "order_id": info.get("id", "N/A") if isinstance(info, dict) else "N/A", "actual_asset": actual_asset}
         return {"success": False, "error": str(info), "actual_asset": asset}
 
-    async def broadcast_signal(self, asset, direction, expiry=60, lead_sec=60):
+    async def broadcast_signal(self, asset, direction, expiry=60, lead_sec=60, strategy="bot"):
         try:
-            await asyncio.sleep(lead_sec)
-            followers = self._active_auto_traders()
-            print(f"[SIGNAL] {asset} {direction} -> {len(followers)} auto-traders", flush=True)
+            if lead_sec:
+                await asyncio.sleep(lead_sec)
+            # المشرف قد يعطّل التداول أو الاستراتيجية أثناء الانتظار
+            if get_setting("admin_auto_enabled", "1") != "1" or get_setting(f"strategy_enabled_{strategy}", "1") != "1":
+                print(f"[SIGNAL] {strategy} disabled by admin, skipping", flush=True)
+                return
+            followers = self._active_auto_traders(strategy)
+            print(f"[SIGNAL] [{strategy}] {asset} {direction} -> {len(followers)} auto-traders", flush=True)
             if not followers:
-                print(f"[SIGNAL] No auto-traders enabled, skipping", flush=True)
                 return
             copied = await self._copy_all(followers, asset, direction, expiry, "TIMER", bypass_cooldown=True)
-            print(f"[SIGNAL] Copied {copied}/{len(followers)}", flush=True)
-            self._log_trade(asset, direction, 0, expiry, "signal", copied)
-            if followers:
-                self._track(asyncio.create_task(self._refresh_after_trade(expiry, [f["license_key"] for f in followers])))
+            print(f"[SIGNAL] [{strategy}] Copied {copied}/{len(followers)}", flush=True)
+            self._log_trade(asset, direction, 0, expiry, f"signal:{strategy}", copied)
+            self._track(asyncio.create_task(self._refresh_after_trade(expiry, [f["license_key"] for f in followers])))
         except Exception as e:
             print(f"[SIGNAL] FATAL: {e}", flush=True)
 

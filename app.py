@@ -23,6 +23,7 @@ from license_manager import (
 from quotex_manager import copy_manager
 from assets import OTC_ASSETS, REAL_ASSETS, EXPIRY_OPTIONS
 from notify import send_telegram_text, telegram_configured
+import strategies
 
 app = Flask(__name__)
 
@@ -188,6 +189,8 @@ def build_user_info(key):
         "start_balance": user.get("start_balance"),
         "notification": user.get("last_notification") or "",
         "admin_auto_enabled": get_setting("admin_auto_enabled", "1") == "1",
+        "strategy": strategies.normalize(user.get("strategy") or strategies.DEFAULT_STRATEGY),
+        "strategies": strategies.public_list(),
     }
 
 
@@ -200,6 +203,7 @@ def do_save_and_enable(key, data):
         max_loss_value = float(data.get("max_loss_value", 0))
         max_profit_value = float(data.get("max_profit_value", 0))
         enable_type = data.get("enable_type", "copy")
+        strategy = str(data.get("strategy") or strategies.DEFAULT_STRATEGY)
     except (ValueError, TypeError):
         return {"ok": False, "error": "قيم غير صحيحة"}, 400
 
@@ -217,8 +221,12 @@ def do_save_and_enable(key, data):
     if max_loss_value < 0 or max_profit_value < 0:
         return {"ok": False, "error": "القيم يجب أن تكون موجبة"}, 400
 
+    if not strategies.is_valid(strategy):
+        strategy = strategies.DEFAULT_STRATEGY
     if enable_type == "auto" and get_setting("admin_auto_enabled", "1") != "1":
         return {"ok": False, "error": "التداول الآلي معطّل حالياً من قبل المدير"}, 400
+    if enable_type == "auto" and not strategies.is_enabled(strategy):
+        return {"ok": False, "error": f"استراتيجية «{strategies.name_of(strategy)}» معطّلة حالياً من المدير. اختر استراتيجية أخرى."}, 400
 
     user = get_user(key)
     if not user:
@@ -255,9 +263,9 @@ def do_save_and_enable(key, data):
         "UPDATE users SET trade_mode = ?, trade_value = ?, "
         "max_loss_value = ?, max_profit_value = ?, settings_locked = 1, "
         "is_copying = ?, is_auto_trading = ?, start_balance = ?, last_notification = NULL, "
-        "balance_version = balance_version + 1 WHERE license_key = ?",
+        "strategy = ?, balance_version = balance_version + 1 WHERE license_key = ?",
         (trade_mode, trade_value, max_loss_value, max_profit_value,
-         is_copying, is_auto_trading, new_start, key),
+         is_copying, is_auto_trading, new_start, strategy, key),
     )
     conn.commit()
     conn.close()
@@ -269,6 +277,7 @@ def do_save_and_enable(key, data):
         "start_balance": new_start,
         "balance": new_start,
         "account_type": account_type,
+        "strategy": strategy,
     }, 200
 
 
@@ -305,10 +314,17 @@ def do_stats(key, requested_account=""):
     if not user or (not user["quotex_ssid"] and not user["quotex_cookies"]):
         return {"ok": False, "error": "غير مرتبط"}, 400
     requested_account = (requested_account or "").strip().lower()
+    view_user = dict(user)
     if requested_account in ("demo", "live"):
-        user = dict(user)
-        user["account_type"] = requested_account
-    return copy_manager.fetch_stats_sync(user), 200
+        view_user["account_type"] = requested_account
+    stats = dict(copy_manager.fetch_stats_sync(view_user))
+    # الرصيد قد يأتي من الذاكرة المؤقتة، لكن حالة التشغيل والإشعار تُقرأ دائماً طازجة
+    # من قاعدة البيانات، حتى ينطفئ المفتاح فوراً عندما يوقفه المدير.
+    stats["is_copying"] = bool(user.get("is_copying"))
+    stats["is_auto_trading"] = bool(user.get("is_auto_trading"))
+    stats["notification"] = user.get("last_notification") or ""
+    stats["strategy"] = strategies.normalize(user.get("strategy") or strategies.DEFAULT_STRATEGY)
+    return stats, 200
 
 
 def do_unlink(key):
@@ -626,7 +642,37 @@ def api_admin_toggles():
         "ok": True,
         "auto_enabled": get_setting("admin_auto_enabled", "1") == "1",
         "bot_enabled": get_setting("admin_bot_enabled", "1") == "1",
+        "strategies": {s["id"]: s["enabled"] for s in strategies.public_list()},
     })
+
+
+@app.route("/api/admin/toggle_strategy", methods=["POST"])
+@admin_api
+def api_admin_toggle_strategy():
+    """لتطبيق المدير: {"strategy": "range_bounce", "enabled": true/false}"""
+    data = request.get_json(silent=True) or {}
+    sid = str(data.get("strategy", ""))
+    if not strategies.is_valid(sid):
+        return jsonify({"ok": False, "error": "استراتيجية غير معروفة"}), 400
+    enabled = bool(data.get("enabled"))
+    set_setting(f"strategy_enabled_{sid}", "1" if enabled else "0")
+    stopped = 0
+    if not enabled:
+        stopped = _stop_auto_users(f"⚠️ أوقف المدير استراتيجية «{strategies.name_of(sid)}». اختر استراتيجية أخرى ثم شغّل من جديد.", sid)
+    return jsonify({"ok": True, "strategy": sid, "enabled": enabled, "stopped": stopped})
+
+
+@app.route("/api/admin/set_auto", methods=["POST"])
+@admin_api
+def api_admin_set_auto():
+    """لتطبيق المدير: {"enabled": false} يوقف التداول الآلي عند كل المستخدمين ويبلغهم."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    set_setting("admin_auto_enabled", "1" if enabled else "0")
+    stopped = 0
+    if not enabled:
+        stopped = _stop_auto_users("⚠️ تم إيقاف التداول الآلي من قبل المدير. يمكنك تشغيله من جديد عند إعادة تفعيله.")
+    return jsonify({"ok": True, "enabled": enabled, "stopped": stopped})
 
 
 # ==================== لوحة المشرف ====================
@@ -690,7 +736,7 @@ def admin_panel():
     active_copy = conn.execute("SELECT COUNT(*) AS c FROM users WHERE is_copying = 1").fetchone()["c"]
     active_auto = conn.execute("SELECT COUNT(*) AS c FROM users WHERE is_auto_trading = 1").fetchone()["c"]
     users_list = conn.execute(
-        "SELECT license_key, quotex_email, quotex_ssid, account_type, is_copying, is_auto_trading, "
+        "SELECT license_key, quotex_email, quotex_ssid, account_type, is_copying, is_auto_trading, strategy, "
         "trade_mode, trade_value, start_balance FROM users ORDER BY created_at DESC"
     ).fetchall()
     logs = conn.execute("SELECT * FROM trade_logs ORDER BY created_at DESC LIMIT 30").fetchall()
@@ -710,6 +756,8 @@ def admin_panel():
         key_duration_options=KEY_DURATION_OPTIONS,
         admin_auto_enabled=get_setting("admin_auto_enabled", "1") == "1",
         admin_bot_enabled=get_setting("admin_bot_enabled", "1") == "1",
+        strategy_list=strategies.public_list(),
+        strategy_counts=copy_manager.strategy_subscribers(),
         system=system_status(),
         tab=request.args.get("tab", "status"),
     )
@@ -793,6 +841,51 @@ def admin_clear_master():
     return _back("status")
 
 
+def _stop_auto_users(notification, strategy=None):
+    """يوقف التداول الآلي لكل المستخدمين (أو لمستخدمي استراتيجية واحدة) ويترك لهم إشعاراً.
+    ويمسح ذاكرة الرصيد المؤقتة كي ينطفئ زر التشغيل عندهم فوراً."""
+    conn = get_db()
+    sql = "SELECT id FROM users WHERE is_auto_trading = 1"
+    params = ()
+    if strategy:
+        if strategy == strategies.DEFAULT_STRATEGY:
+            sql += " AND (strategy IS NULL OR strategy = '' OR strategy = 'bot')"
+        else:
+            sql += " AND strategy = ?"
+            params = (strategy,)
+    ids = [r["id"] for r in conn.execute(sql, params).fetchall()]
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        conn.execute(
+            "UPDATE users SET is_auto_trading = 0, settings_locked = 0, start_balance = NULL, last_notification = ?, "
+            f"balance_version = balance_version + 1 WHERE id IN ({marks})",
+            (notification, *ids),
+        )
+        conn.commit()
+    conn.close()
+    for uid in ids:
+        clear_user_cache(uid)
+    return len(ids)
+
+
+@app.route("/admin/toggle_strategy", methods=["POST"])
+@admin_required
+def admin_toggle_strategy():
+    sid = request.values.get("strategy", "")
+    if not strategies.is_valid(sid):
+        flash("استراتيجية غير معروفة", "error")
+        return _back("strategies")
+    new_val = "0" if strategies.is_enabled(sid) else "1"
+    set_setting(f"strategy_enabled_{sid}", new_val)
+    name = strategies.name_of(sid)
+    if new_val == "0":
+        n = _stop_auto_users(f"⚠️ أوقف المدير استراتيجية «{name}». اختر استراتيجية أخرى ثم شغّل من جديد.", sid)
+        flash(f"⛔ تم تعطيل «{name}» — أُوقف {n} مستخدم وأُبلغوا", "success")
+    else:
+        flash(f"✅ تم تفعيل «{name}»", "success")
+    return _back("strategies")
+
+
 @app.route("/admin/toggle_auto_trading", methods=["POST"])
 @admin_required
 def admin_toggle_auto_trading():
@@ -801,15 +894,8 @@ def admin_toggle_auto_trading():
     set_setting("admin_auto_enabled", new_val)
 
     if new_val == "0":
-        conn = get_db()
-        conn.execute(
-            "UPDATE users SET is_auto_trading = 0, last_notification = ?, "
-            "balance_version = balance_version + 1 WHERE is_auto_trading = 1",
-            ("⚠️ تم تعطيل التداول الآلي من قبل المدير",),
-        )
-        conn.commit()
-        conn.close()
-        flash("⛔ تم تعطيل التداول الآلي — المستخدمون أُبلغوا", "success")
+        n = _stop_auto_users("⚠️ تم إيقاف التداول الآلي من قبل المدير. يمكنك تشغيله من جديد عند إعادة تفعيله.")
+        flash(f"⛔ تم تعطيل التداول الآلي — أُوقف {n} مستخدم وأُبلغوا", "success")
     else:
         flash("✅ تم تفعيل التداول الآلي — يمكن للمستخدمين التفعيل من جديد", "success")
     return _back("status")

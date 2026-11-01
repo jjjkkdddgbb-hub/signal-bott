@@ -1,0 +1,7 @@
+# ملفات لا يجب رفعها إلى GitHub أبداً
+.env
+*.db
+qx_session.json
+session.json
+__pycache__/
+*.pyc

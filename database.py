@@ -266,6 +266,7 @@ _SCHEMA = [
         last_notification TEXT,
         balance_version INTEGER DEFAULT 0,
         settings_locked INTEGER DEFAULT 0,
+        strategy TEXT DEFAULT 'bot',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (license_key) REFERENCES licenses(key)
     )
@@ -305,7 +306,22 @@ def init_db():
             conn.commit()
     finally:
         conn.close()
+    _migrate()
     print(f"[DB] init_db completed (turso={_USE_TURSO})", flush=True)
+
+
+def _migrate():
+    """يضيف الأعمدة الجديدة لقواعد البيانات القديمة (آمن إذا كان العمود موجوداً)."""
+    for stmt in ("ALTER TABLE users ADD COLUMN strategy TEXT DEFAULT 'bot'",):
+        conn = get_db()
+        try:
+            conn.execute(stmt)
+            conn.commit()
+            print(f"[DB] migrated: {stmt}", flush=True)
+        except Exception:
+            pass  # العمود موجود مسبقاً
+        finally:
+            conn.close()
 
 
 def _try_turso():

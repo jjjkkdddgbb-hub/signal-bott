@@ -500,6 +500,13 @@ def api_app_unlink(key):
     return _respond(do_unlink(key))
 
 
+def _is_network_block(err):
+    """أخطاء سببها حظر/ازدحام الاتصال بـ Quotex وليس خطأ في الجلسة نفسها."""
+    e = str(err or "").lower()
+    return any(w in e for w in ("rate_limited", "429", "rejected", "cooldown", "timeout", "refused"))
+
+
+
 @app.route("/api/link", methods=["POST"])
 def api_link():
     data = request.get_json(silent=True) or {}
@@ -517,14 +524,20 @@ def api_link():
         check = copy_manager.run_async(copy_manager.test_session(ssid or "", cookies or None), timeout=90)
     except Exception as e:
         check = {"success": False, "error": str(e)}
+    unverified = False
     if not check.get("success"):
-        return jsonify({"ok": False, "error": check.get("error", "الجلسة لا تعمل")}), 400
+        err = check.get("error", "الجلسة لا تعمل")
+        # Quotex يحظر اتصال الخادم مؤقتاً (429): نحفظ الجلسة كما التقطها التطبيق ولا نرفضها
+        if len(ssid) >= 25 and _is_network_block(err):
+            unverified = True
+        else:
+            return jsonify({"ok": False, "error": err}), 400
     final_ssid = check.get("ssid", "") or ssid
     user = get_user(key)
     save_user_session(key, final_ssid, cookies, email)
     if user:
         clear_user_cache(user["id"])
-    return jsonify({"ok": True, "ssid_extracted": bool(final_ssid and not ssid)})
+    return jsonify({"ok": True, "ssid_extracted": bool(final_ssid and not ssid), "unverified": unverified})
 
 
 # ==================== API لتطبيق المدير (Oscar Admin) ====================
@@ -555,8 +568,13 @@ def api_admin_link_master():
     except Exception as e:
         check = {"success": False, "error": str(e)}
 
+    unverified = False
     if not check.get("success"):
-        return jsonify({"ok": False, "error": check.get("error", "الجلسة لا تعمل")}), 400
+        err = check.get("error", "الجلسة لا تعمل")
+        if len(ssid) >= 25 and _is_network_block(err):
+            unverified = True
+        else:
+            return jsonify({"ok": False, "error": err}), 400
 
     final_ssid = check.get("ssid", "") or ssid
     set_secret_setting("master_ssid", final_ssid)

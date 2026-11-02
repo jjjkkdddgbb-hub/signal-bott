@@ -249,14 +249,20 @@ def do_save_and_enable(key, data):
     except Exception as e:
         return {"ok": False, "error": f"تعذر الاتصال بالحساب: {e}"}, 400
 
+    pending = False
     if not stats.get("ok"):
         err = stats.get("error", "تعذر الاتصال")
-        return {"ok": False, "error": f"تعذر الاتصال بالحساب: {err}"}, 400
-    if stats["balance"] <= 0:
-        label = "الحقيقي" if account_type == "live" else "التجريبي"
-        return {"ok": False, "error": f"رصيد حسابك {label} صفر. أضف أموالاً أو غيّر نوع الحساب"}, 400
-
-    new_start = stats["balance"]
+        # Quotex يحظر الخادم مؤقتاً: نفعّل الآن، ويُحسب رصيد البداية عند أول اتصال ناجح
+        if _is_network_block(err):
+            pending = True
+            new_start = None
+        else:
+            return {"ok": False, "error": f"تعذر الاتصال بالحساب: {err}"}, 400
+    else:
+        if stats["balance"] <= 0:
+            label = "الحقيقي" if account_type == "live" else "التجريبي"
+            return {"ok": False, "error": f"رصيد حسابك {label} صفر. أضف أموالاً أو غيّر نوع الحساب"}, 400
+        new_start = stats["balance"]
 
     conn = get_db()
     conn.execute(
@@ -275,7 +281,8 @@ def do_save_and_enable(key, data):
         "is_copying": bool(is_copying),
         "is_auto_trading": bool(is_auto_trading),
         "start_balance": new_start,
-        "balance": new_start,
+        "balance": new_start or 0,
+        "pending": pending,
         "account_type": account_type,
         "strategy": strategy,
     }, 200

@@ -37,6 +37,7 @@
 <main class="wrap wide">
   <nav class="tabs" aria-label="أقسام اللوحة">
     <a href="?tab=status" {% if tab == 'status' %}aria-current="page"{% endif %}>الحالة والتحكم</a>
+    <a href="?tab=strategies" {% if tab == 'strategies' %}aria-current="page"{% endif %}>الاستراتيجيات</a>
     <a href="?tab=keys" {% if tab == 'keys' %}aria-current="page"{% endif %}>المفاتيح</a>
     <a href="?tab=users" {% if tab == 'users' %}aria-current="page"{% endif %}>المستخدمون</a>
     <a href="?tab=logs" {% if tab == 'logs' %}aria-current="page"{% endif %}>الصفقات</a>
@@ -226,6 +227,21 @@
     {% else %}
     <p class="sub">لم يسجّل أحد الدخول بعد.</p>
     {% endif %}
+  </section>
+  {% endif %}
+
+  {# ================= الاستراتيجيات ================= #}
+  {% if tab == 'strategies' %}
+  <section class="card">
+    <h2>الاستراتيجيات</h2>
+    <p class="sub">كل مستخدم يختار استراتيجيته الخاصة. تعطيل استراتيجية هنا يوقف من يستخدمها فقط ويصلهم إشعار.</p>
+    {% for s in strategy_list %}
+    {{ toggle('/admin/toggle_strategy?strategy=' ~ s.id, s.enabled,
+              s.icon ~ ' ' ~ s.name ~ ' — ' ~ (strategy_counts.get(s.id, 0)) ~ ' مستخدم',
+              s.tagline,
+              'سيتم إيقاف كل من يستخدم هذه الاستراتيجية وإبلاغهم. متأكد؟',
+              'سيتم السماح للمستخدمين باختيار هذه الاستراتيجية. متأكد؟') }}
+    {% endfor %}
   </section>
   {% endif %}
 

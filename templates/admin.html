@@ -38,6 +38,7 @@
   <nav class="tabs" aria-label="أقسام اللوحة">
     <a href="?tab=status" {% if tab == 'status' %}aria-current="page"{% endif %}>الحالة والتحكم</a>
     <a href="?tab=strategies" {% if tab == 'strategies' %}aria-current="page"{% endif %}>الاستراتيجيات</a>
+    <a href="?tab=appearance" {% if tab == 'appearance' %}aria-current="page"{% endif %}>المظهر</a>
     <a href="?tab=keys" {% if tab == 'keys' %}aria-current="page"{% endif %}>المفاتيح</a>
     <a href="?tab=users" {% if tab == 'users' %}aria-current="page"{% endif %}>المستخدمون</a>
     <a href="?tab=logs" {% if tab == 'logs' %}aria-current="page"{% endif %}>الصفقات</a>
@@ -60,6 +61,11 @@
               'عند الإيقاف يتوقف تداول جميع المستخدمين الآلي ويصلهم إشعار.',
               'سيتم إيقاف التداول الآلي عن جميع المستخدمين وإبلاغهم. متأكد؟',
               'سيتم السماح للمستخدمين بتفعيل التداول الآلي. متأكد؟') }}
+    {{ toggle('/admin/toggle_rest', not rest_mode,
+              'اتصال السيرفر بـ Quotex',
+              'عند الإيقاف (وضع الراحة) لا يتصل السيرفر بـ Quotex أبداً ويتوقف الجميع، لتهدأ الحظور (429).',
+              'سيدخل السيرفر وضع الراحة: يتوقف كل التداول والنسخ عند الجميع ولا اتصال بـ Quotex. متأكد؟',
+              'سيعود السيرفر للاتصال بـ Quotex. متأكد؟') }}
     {{ toggle('/admin/toggle_telegram_bot', admin_bot_enabled,
               'إرسال الإشارات إلى تيليجرام',
               'عند الإيقاف يستمر البوت بالتحليل لكن لا يرسل شيئاً للقناة.',
@@ -89,6 +95,9 @@
                 'بوت الإشارات',
                 (system.bot_status or 'لا توجد حالة بعد') if system.signals_env else 'غير مفعّل: اجعل ENABLE_SIGNALS = true في Render',
                 'مفعّل', 'متوقف') }}
+      {% if system.rest_mode %}
+      {{ health(false, 'وضع الراحة', 'السيرفر لا يتصل بـ Quotex حالياً والجميع متوقفون. أعد تشغيل «اتصال السيرفر بـ Quotex» عندما تريد العودة.', 'طبيعي', 'وضع الراحة مفعّل', True) }}
+      {% endif %}
       {% if system.quotex_block_min %}
       {{ health(false, 'اتصال Quotex', 'Quotex حظر الاتصال مؤقتاً (429). الانتظار المتبقي تقريباً: ' ~ system.quotex_block_min ~ ' دقيقة. البوت ينتظر تلقائياً.', 'سليم', 'محظور مؤقتاً', True) }}
       {% endif %}
@@ -167,7 +176,7 @@
             {% if lic.device_ip %}
             <form action="/admin/reset_device" method="POST" style="display:inline">
               <input type="hidden" name="key" value="{{ lic.key }}">
-              <span class="badge idle">🔒 مرتبط</span>
+              <span class="badge idle">🔒 مرتبط بجهاز ({{ lic.device_ip[:6] }}…)</span>
               <button class="btn small ghost" type="submit">إعادة تعيين</button>
             </form>
             {% else %}—{% endif %}
@@ -228,6 +237,51 @@
     <p class="sub">لم يسجّل أحد الدخول بعد.</p>
     {% endif %}
   </section>
+  {% endif %}
+
+  {# ================= المظهر ================= #}
+  {% if tab == 'appearance' %}
+  <section class="card">
+    <h2>خلفية تطبيق المستخدمين</h2>
+    <p class="sub">اختر صورة لتظهر خلف شاشة تطبيق المستخدم. تُصغَّر تلقائياً قبل الرفع.</p>
+    {% if has_background %}
+    <img src="/admin/background_preview?v={{ range(1, 99999) | random }}" alt="الخلفية الحالية" style="max-width:100%;border-radius:18px;margin:8px 0 14px;">
+    {% endif %}
+    <form action="/admin/set_background" method="POST" enctype="multipart/form-data" id="bgForm">
+      <input type="file" id="bgFile" accept="image/*" required style="margin-bottom:12px;max-width:100%">
+      <input type="hidden" id="bgHidden">
+      <button class="btn primary" type="submit" id="bgBtn">تعيين كخلفية</button>
+    </form>
+    {% if has_background %}
+    <form action="/admin/clear_background" method="POST" data-confirm="حذف الخلفية الحالية؟" style="margin-top:10px">
+      <button class="btn small bad" type="submit">حذف الخلفية</button>
+    </form>
+    {% endif %}
+  </section>
+  <script>
+  (function () {
+    var form = document.getElementById('bgForm'); if (!form) return;
+    form.addEventListener('submit', function (ev) {
+      var f = document.getElementById('bgFile').files[0]; if (!f) return;
+      ev.preventDefault();
+      var btn = document.getElementById('bgBtn'); btn.disabled = true; btn.textContent = 'جاري التجهيز…';
+      var img = new Image(), url = URL.createObjectURL(f);
+      img.onload = function () {
+        var max = 1280, w = img.width, h = img.height, k = Math.min(1, max / Math.max(w, h));
+        var cv = document.createElement('canvas'); cv.width = Math.round(w * k); cv.height = Math.round(h * k);
+        cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+        cv.toBlob(function (blob) {
+          var fd = new FormData(); fd.append('image', blob, 'bg.jpg');
+          fetch('/admin/set_background', { method: 'POST', body: fd, credentials: 'same-origin' })
+            .then(function () { location.href = '/admin/panel?tab=appearance'; })
+            .catch(function () { btn.disabled = false; btn.textContent = 'تعيين كخلفية'; alert('فشل الرفع'); });
+        }, 'image/jpeg', 0.82);
+      };
+      img.onerror = function () { btn.disabled = false; btn.textContent = 'تعيين كخلفية'; alert('تعذر قراءة الصورة'); };
+      img.src = url;
+    });
+  })();
+  </script>
   {% endif %}
 
   {# ================= الاستراتيجيات ================= #}

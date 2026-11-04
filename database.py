@@ -289,6 +289,20 @@ _SCHEMA = [
         value TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS trade_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        asset TEXT,
+        direction TEXT,
+        amount REAL,
+        strategy TEXT,
+        source TEXT,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 ]
 
 
@@ -425,3 +439,39 @@ def clear_user_session(license_key):
 
 def get_session_plain(user):
     return decrypt(user.get("quotex_ssid")), decrypt(user.get("quotex_cookies"))
+
+
+# ---------- سجل أحداث الصفقات (يعرضه تطبيق المستخدم ويشغّل الأصوات) ----------
+def add_event(user_id, kind, asset="", direction="", amount=0.0, strategy="", source="", note=""):
+    """kind: trade_open | session_win | session_loss"""
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO trade_events (user_id, kind, asset, direction, amount, strategy, source, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, kind, asset or "", direction or "", float(amount or 0), strategy or "", source or "", note or "", now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[EVENT] add failed: {e}", flush=True)
+
+
+def get_events(user_id, after=0, limit=40):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM trade_events WHERE user_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        (user_id, int(after or 0), int(limit)),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def last_event_id(user_id):
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT MAX(id) AS m FROM trade_events WHERE user_id = ?", (user_id,)).fetchone()
+        conn.close()
+        return int(row["m"] or 0) if row else 0
+    except Exception:
+        return 0

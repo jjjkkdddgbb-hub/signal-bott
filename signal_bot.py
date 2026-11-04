@@ -360,6 +360,15 @@ async def main_loop():
 
     while True:
         try:
+            # وضع الراحة: المشرف أوقف كل اتصالات Quotex
+            if safe_setting("quotex_rest", "0") == "1":
+                if client is not None:
+                    await close_client(client)
+                    client = None
+                set_status("وضع الراحة — لا اتصال بـ Quotex")
+                await asyncio.sleep(30)
+                continue
+
             # إذا كان Quotex حاظراً الاتصال مؤقتاً (429) ننتظر ولا نضغط عليه
             blocked = copy_manager.rate_limit_remaining()
             if blocked > 0 and client is None:

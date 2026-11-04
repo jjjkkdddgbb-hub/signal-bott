@@ -8,12 +8,13 @@ import json as json_lib
 from functools import wraps
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, session, flash, jsonify, make_response
+    url_for, session, flash, jsonify, make_response, Response
 )
 
 from database import (
     init_db, get_db, get_setting, set_setting, get_secret_setting,
     set_secret_setting, save_user_session, clear_user_session, db_info,
+    get_events, last_event_id,
 )
 from license_manager import (
     generate_key, validate_key, get_all_licenses,
@@ -103,6 +104,48 @@ def on_error(e):
     )
 
 
+# ==================== ربط المفتاح بجهاز واحد ====================
+_DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+WEB_USER_LOGIN = os.environ.get("WEB_USER_LOGIN", "0") == "1"
+
+
+@app.before_request
+def _device_guard():
+    """كل مفتاح يعمل على جهاز واحد فقط: أول جهاز يستخدمه يُسجَّل، وأي جهاز آخر يُرفض."""
+    p = request.path
+    if request.method == "OPTIONS":
+        return None
+    if p.startswith("/api/app/"):
+        key = p.rstrip("/").split("/")[-1].strip().upper()
+    elif p == "/api/link":
+        key = str((request.get_json(silent=True) or {}).get("license_key", "")).strip().upper()
+    else:
+        return None
+    if not key:
+        return None
+    dev = (request.headers.get("X-Device-Id") or "").strip()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT device_ip FROM licenses WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None  # مفتاح غير موجود: يتولى المسار نفسه الرد
+        if not _DEVICE_RE.match(dev):
+            return jsonify({"ok": False, "error": "حدّث تطبيق Oskarix إلى آخر نسخة", "device_locked": True}), 403
+        bound = row["device_ip"] or ""
+        if not bound:
+            conn.execute(
+                "UPDATE licenses SET device_ip = ? WHERE key = ? AND (device_ip IS NULL OR device_ip = '')",
+                (dev, key),
+            )
+            conn.commit()
+            bound = (conn.execute("SELECT device_ip FROM licenses WHERE key = ?", (key,)).fetchone()["device_ip"]) or ""
+    finally:
+        conn.close()
+    if bound != dev:
+        return jsonify({"ok": False, "error": "هذا المفتاح مستخدم على جهاز آخر", "device_locked": True}), 403
+    return None
+
+
 def clear_user_cache(user_id):
     try:
         copy_manager.clear_cache(user_id)
@@ -189,8 +232,12 @@ def build_user_info(key):
         "start_balance": user.get("start_balance"),
         "notification": user.get("last_notification") or "",
         "admin_auto_enabled": get_setting("admin_auto_enabled", "1") == "1",
-        "strategy": strategies.normalize(user.get("strategy") or strategies.DEFAULT_STRATEGY),
+        "strategy": strategies.parse_list(user.get("strategy"))[0],
+        "selected_strategies": strategies.parse_list(user.get("strategy")),
         "strategies": strategies.public_list(),
+        "rest_mode": get_setting("quotex_rest", "0") == "1",
+        "last_event_id": last_event_id(user["id"]),
+        "background_version": get_setting("app_background_version", "0"),
     }
 
 
@@ -203,7 +250,10 @@ def do_save_and_enable(key, data):
         max_loss_value = float(data.get("max_loss_value", 0))
         max_profit_value = float(data.get("max_profit_value", 0))
         enable_type = data.get("enable_type", "copy")
-        strategy = str(data.get("strategy") or strategies.DEFAULT_STRATEGY)
+        raw_strats = data.get("strategies")
+        if not raw_strats:
+            raw_strats = data.get("strategy") or strategies.DEFAULT_STRATEGY
+        selected = strategies.parse_list(raw_strats)
     except (ValueError, TypeError):
         return {"ok": False, "error": "قيم غير صحيحة"}, 400
 
@@ -221,12 +271,17 @@ def do_save_and_enable(key, data):
     if max_loss_value < 0 or max_profit_value < 0:
         return {"ok": False, "error": "القيم يجب أن تكون موجبة"}, 400
 
-    if not strategies.is_valid(strategy):
-        strategy = strategies.DEFAULT_STRATEGY
+    if get_setting("quotex_rest", "0") == "1":
+        return {"ok": False, "error": "🛠️ السيرفر في وضع الراحة مؤقتاً. حاول لاحقاً."}, 400
     if enable_type == "auto" and get_setting("admin_auto_enabled", "1") != "1":
         return {"ok": False, "error": "التداول الآلي معطّل حالياً من قبل المدير"}, 400
-    if enable_type == "auto" and not strategies.is_enabled(strategy):
-        return {"ok": False, "error": f"استراتيجية «{strategies.name_of(strategy)}» معطّلة حالياً من المدير. اختر استراتيجية أخرى."}, 400
+    if enable_type == "auto":
+        off = [strategies.name_of(s) for s in selected if not strategies.is_enabled(s)]
+        if off:
+            return {"ok": False, "error": "هذه الاستراتيجيات معطّلة حالياً من المدير: " + "، ".join(off) + ". ألغِ اختيارها أو اختر غيرها."}, 400
+    else:
+        selected = [strategies.DEFAULT_STRATEGY]
+    strategy = strategies.join_list(selected)
 
     user = get_user(key)
     if not user:
@@ -284,7 +339,8 @@ def do_save_and_enable(key, data):
         "balance": new_start or 0,
         "pending": pending,
         "account_type": account_type,
-        "strategy": strategy,
+        "strategy": selected[0],
+        "selected_strategies": selected,
     }, 200
 
 
@@ -330,7 +386,7 @@ def do_stats(key, requested_account=""):
     stats["is_copying"] = bool(user.get("is_copying"))
     stats["is_auto_trading"] = bool(user.get("is_auto_trading"))
     stats["notification"] = user.get("last_notification") or ""
-    stats["strategy"] = strategies.normalize(user.get("strategy") or strategies.DEFAULT_STRATEGY)
+    stats["strategy"] = strategies.parse_list(user.get("strategy"))[0]
     return stats, 200
 
 
@@ -393,6 +449,8 @@ def dashboard():
 
 @app.route("/app_login/<key>")
 def app_login(key):
+    if not WEB_USER_LOGIN:
+        return "<meta charset='utf-8'><h2>⚠️ الدخول من المتصفح غير متاح</h2><p>استخدم تطبيق Oskarix على جهازك.</p>", 403
     key = key.strip().upper()
     ok, msg = is_key_valid(key)
     if not ok:
@@ -467,6 +525,44 @@ def api_app_user_info(key):
     return jsonify(info)
 
 
+@app.route("/api/app/events/<key>")
+def api_app_events(key):
+    key, err = _app_key_or_error(key)
+    if err:
+        return err
+    user = ensure_user(key)
+    after = request.args.get("after", default=0, type=int)
+    out = []
+    for e in get_events(user["id"], after, 40):
+        out.append({
+            "id": e["id"], "kind": e["kind"], "asset": e["asset"], "direction": e["direction"],
+            "amount": e["amount"], "strategy": e["strategy"],
+            "strategy_name": strategies.name_of(e["strategy"]) if e["strategy"] else "نسخ صفقات المدير",
+            "source": e["source"], "note": e["note"], "at": e["created_at"],
+        })
+    return jsonify({"ok": True, "events": out, "latest_id": last_event_id(user["id"])})
+
+
+@app.route("/api/app/background/<key>")
+def api_app_background(key):
+    key, err = _app_key_or_error(key)
+    if err:
+        return err
+    raw = get_setting("app_background", "")
+    if not raw or "," not in raw:
+        return jsonify({"ok": False, "error": "no_background"}), 404
+    import base64
+    head, b64 = raw.split(",", 1)
+    mime = head.split(";")[0].replace("data:", "") or "image/jpeg"
+    try:
+        data = base64.b64decode(b64)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad_background"}), 404
+    resp = Response(data, mimetype=mime)
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    return resp
+
+
 @app.route("/api/app/save_and_enable/<key>", methods=["POST"])
 def api_app_save_and_enable(key):
     key, err = _app_key_or_error(key)
@@ -510,7 +606,7 @@ def api_app_unlink(key):
 def _is_network_block(err):
     """أخطاء سببها حظر/ازدحام الاتصال بـ Quotex وليس خطأ في الجلسة نفسها."""
     e = str(err or "").lower()
-    return any(w in e for w in ("rate_limited", "429", "rejected", "cooldown", "timeout", "refused"))
+    return any(w in e for w in ("rate_limited", "429", "rejected", "cooldown", "timeout", "refused", "rest_mode"))
 
 
 
@@ -746,6 +842,7 @@ def system_status():
         "last_signal_at": _safe_setting("last_signal_at", ""),
         "quotex_block_min": copy_manager.rate_limit_remaining() // 60 + (1 if copy_manager.rate_limit_remaining() else 0),
         "api_open": not ADMIN_API_TOKEN,
+        "rest_mode": _safe_setting("quotex_rest", "0") == "1",
         "weak_password": len(ADMIN_PASSWORD) < 10,
     }
 
@@ -781,6 +878,8 @@ def admin_panel():
         key_duration_options=KEY_DURATION_OPTIONS,
         admin_auto_enabled=get_setting("admin_auto_enabled", "1") == "1",
         admin_bot_enabled=get_setting("admin_bot_enabled", "1") == "1",
+        rest_mode=get_setting("quotex_rest", "0") == "1",
+        has_background=bool(get_setting("app_background", "")),
         strategy_list=strategies.public_list(),
         strategy_counts=copy_manager.strategy_subscribers(),
         system=system_status(),
@@ -867,23 +966,50 @@ def admin_clear_master():
 
 
 def _stop_auto_users(notification, strategy=None):
-    """يوقف التداول الآلي لكل المستخدمين (أو لمستخدمي استراتيجية واحدة) ويترك لهم إشعاراً.
+    """يوقف التداول الآلي لكل المستخدمين، أو يزيل استراتيجية واحدة من اختيارات من يستخدمها.
+    من لم يبقَ له غيرها يُوقَف ويُبلَّغ؛ ومن له غيرها يكمل بالباقي ويصله إشعار فقط.
     ويمسح ذاكرة الرصيد المؤقتة كي ينطفئ زر التشغيل عندهم فوراً."""
     conn = get_db()
-    sql = "SELECT id FROM users WHERE is_auto_trading = 1"
-    params = ()
-    if strategy:
-        if strategy == strategies.DEFAULT_STRATEGY:
-            sql += " AND (strategy IS NULL OR strategy = '' OR strategy = 'bot')"
-        else:
-            sql += " AND strategy = ?"
-            params = (strategy,)
-    ids = [r["id"] for r in conn.execute(sql, params).fetchall()]
-    if ids:
-        marks = ",".join("?" for _ in ids)
+    rows = conn.execute("SELECT id, strategy FROM users WHERE is_auto_trading = 1").fetchall()
+    to_stop, to_trim = [], []
+    for r in rows:
+        chosen = strategies.parse_list(r["strategy"])
+        if strategy is None:
+            to_stop.append(r["id"])
+        elif strategy in chosen:
+            left = [x for x in chosen if x != strategy]
+            if left:
+                to_trim.append((r["id"], ",".join(left)))
+            else:
+                to_stop.append(r["id"])
+    if to_stop:
+        marks = ",".join("?" for _ in to_stop)
         conn.execute(
             "UPDATE users SET is_auto_trading = 0, settings_locked = 0, start_balance = NULL, last_notification = ?, "
             f"balance_version = balance_version + 1 WHERE id IN ({marks})",
+            (notification, *to_stop),
+        )
+    for uid, left in to_trim:
+        conn.execute(
+            "UPDATE users SET strategy = ?, last_notification = ?, balance_version = balance_version + 1 WHERE id = ?",
+            (left, f"⚠️ أوقف المدير استراتيجية «{strategies.name_of(strategy)}».\nيستمر حسابك بالاستراتيجيات الأخرى التي اخترتها.", uid),
+        )
+    conn.commit()
+    conn.close()
+    for uid in to_stop + [u for u, _ in to_trim]:
+        clear_user_cache(uid)
+    return len(to_stop) + len(to_trim)
+
+
+def _stop_all_users(notification):
+    """وضع الراحة: يوقف النسخ والتداول الآلي عن الجميع ويبلغهم."""
+    conn = get_db()
+    ids = [r["id"] for r in conn.execute("SELECT id FROM users WHERE is_copying = 1 OR is_auto_trading = 1").fetchall()]
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        conn.execute(
+            "UPDATE users SET is_copying = 0, is_auto_trading = 0, settings_locked = 0, start_balance = NULL, "
+            f"last_notification = ?, balance_version = balance_version + 1 WHERE id IN ({marks})",
             (notification, *ids),
         )
         conn.commit()
@@ -891,6 +1017,83 @@ def _stop_auto_users(notification, strategy=None):
     for uid in ids:
         clear_user_cache(uid)
     return len(ids)
+
+
+def _set_rest(enabled):
+    set_setting("quotex_rest", "1" if enabled else "0")
+    if enabled:
+        return _stop_all_users("🛠️ السيرفر في وضع الراحة مؤقتاً. أُوقف التداول وسيُعاد فتحه من المدير لاحقاً.")
+    return 0
+
+
+@app.route("/admin/toggle_rest", methods=["POST"])
+@admin_required
+def admin_toggle_rest():
+    enable = get_setting("quotex_rest", "0") != "1"
+    n = _set_rest(enable)
+    if enable:
+        flash(f"🛠️ تم تفعيل وضع الراحة — أُوقف {n} مستخدم ولن يتصل السيرفر بـ Quotex", "success")
+    else:
+        flash("✅ انتهى وضع الراحة — يمكن للمستخدمين التشغيل من جديد", "success")
+    return _back("status")
+
+
+@app.route("/api/admin/set_rest", methods=["POST"])
+@admin_api
+def api_admin_set_rest():
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    n = _set_rest(enabled)
+    return jsonify({"ok": True, "rest_mode": enabled, "stopped": n})
+
+
+MAX_BG_BYTES = 1_500_000
+
+
+@app.route("/admin/set_background", methods=["POST"])
+@admin_required
+def admin_set_background():
+    import base64
+    f = request.files.get("image")
+    if not f:
+        flash("اختر صورة أولاً", "error")
+        return _back("appearance")
+    data = f.read()
+    if len(data) > MAX_BG_BYTES:
+        flash("الصورة كبيرة جداً (الحد 1.5 ميغابايت). صغّرها ثم أعد المحاولة", "error")
+        return _back("appearance")
+    if data[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        flash("الملف ليس صورة صالحة (JPG أو PNG أو WEBP)", "error")
+        return _back("appearance")
+    set_setting("app_background", f"data:{mime};base64," + base64.b64encode(data).decode())
+    set_setting("app_background_version", str(int(time.time())))
+    flash("✅ تم تعيين الخلفية وستظهر في تطبيق المستخدمين", "success")
+    return _back("appearance")
+
+
+@app.route("/admin/clear_background", methods=["POST"])
+@admin_required
+def admin_clear_background():
+    set_setting("app_background", "")
+    set_setting("app_background_version", str(int(time.time())))
+    flash("تم حذف الخلفية", "success")
+    return _back("appearance")
+
+
+@app.route("/admin/background_preview")
+@admin_required
+def admin_background_preview():
+    import base64
+    raw = get_setting("app_background", "")
+    if not raw or "," not in raw:
+        return ("", 404)
+    head, b64 = raw.split(",", 1)
+    return Response(base64.b64decode(b64), mimetype=head.split(";")[0].replace("data:", ""))
 
 
 @app.route("/admin/toggle_strategy", methods=["POST"])

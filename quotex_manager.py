@@ -30,7 +30,7 @@ os.environ['no_proxy'] = '127.0.0.1,localhost'
 
 from pyquotex.stable_api import Quotex
 from database import (
-    get_db, get_setting, get_secret_setting, get_session_plain, now_iso,
+    get_db, get_setting, get_secret_setting, get_session_plain, now_iso, add_event,
 )
 
 HOSTS_TO_TRY = ["quotex.com"]
@@ -109,8 +109,8 @@ class QuotexCopyManager:
 
     def note_rate_limit(self):
         """يُستدعى عند ظهور 429: يوقف الاتصال 15 دقيقة، ثم 30، ثم ساعة."""
-        self._block_level = min(self._block_level + 1, 3)
-        wait = {1: 900, 2: 1800, 3: 3600}[self._block_level]
+        self._block_level = min(self._block_level + 1, 5)
+        wait = {1: 900, 2: 1800, 3: 3600, 4: 7200, 5: 14400}[self._block_level]
         self._block_until = time.time() + wait
         print(f"[QX] 429 من Quotex — إيقاف كل محاولات الاتصال {wait // 60} دقيقة", flush=True)
 
@@ -193,6 +193,10 @@ class QuotexCopyManager:
         return client
 
     async def _connect_any_host(self, ssid, cookies, user_id=None, bypass_cooldown=False):
+        # وضع الراحة: المشرف أوقف كل اتصالات Quotex مؤقتاً
+        if get_setting("quotex_rest", "0") == "1":
+            return None, None, "rest_mode: السيرفر في وضع الراحة مؤقتاً"
+
         # إيقاف عام بعد خطأ 429
         remaining = self.rate_limit_remaining()
         if remaining > 0:
@@ -368,6 +372,9 @@ class QuotexCopyManager:
         )
         conn.commit()
         conn.close()
+        kind = "session_loss" if "الخسارة" in (notification or "") else ("session_win" if "الربح" in (notification or "") else "")
+        if kind:
+            add_event(user_id, kind, note=notification)
         print(f"[STOP_LIMIT] user {user_id} stopped", flush=True)
 
     async def refresh_and_notify(self, user):
@@ -425,7 +432,7 @@ class QuotexCopyManager:
                 pass
         return (False, "فشلت", asset)
 
-    async def copy_to_follower(self, follower, asset, direction, expiry, time_mode, bypass_cooldown=False):
+    async def copy_to_follower(self, follower, asset, direction, expiry, time_mode, bypass_cooldown=False, strategy=None):
         ssid, cookies = get_session_plain(follower)
         if ssid and (ssid.startswith('<') or 'object at 0x' in ssid):
             ssid = None
@@ -483,6 +490,7 @@ class QuotexCopyManager:
             status, info, _ = await self._buy(client, asset, direction, amount, expiry, time_mode)
             if status:
                 print(f"[COPY] ✅ user {user_id} ({acct_label}): ${amount:.2f} opened", flush=True)
+                add_event(user_id, "trade_open", asset, direction, amount, strategy or "", "auto" if strategy else "copy")
                 return {"success": True, "order_id": info.get("id", "N/A") if isinstance(info, dict) else "N/A", "amount": amount}
             else:
                 save_notification(f"⚠️ فشل تنفيذ الصفقة على الحساب ({acct_label}).\nالسبب: {info}")
@@ -513,11 +521,9 @@ class QuotexCopyManager:
         )
         params = [now_iso()]
         if strategy:
-            if strategy == "bot":
-                sql += " AND (u.strategy IS NULL OR u.strategy = '' OR u.strategy = 'bot')"
-            else:
-                sql += " AND u.strategy = ?"
-                params.append(strategy)
+            # المستخدم قد يختار أكثر من استراتيجية (مفصولة بفاصلة)
+            sql += " AND (',' || COALESCE(NULLIF(u.strategy, ''), 'bot') || ',') LIKE ?"
+            params.append(f"%,{strategy},%")
         conn = get_db()
         rows = conn.execute(sql, tuple(params)).fetchall()
         conn.close()
@@ -529,15 +535,18 @@ class QuotexCopyManager:
         try:
             conn = get_db()
             rows = conn.execute(
-                "SELECT COALESCE(NULLIF(u.strategy, ''), 'bot') AS s, COUNT(*) AS c "
+                "SELECT COALESCE(NULLIF(u.strategy, ''), 'bot') AS s "
                 "FROM users u JOIN licenses l ON l.key = u.license_key "
                 "WHERE u.is_auto_trading = 1 AND u.quotex_ssid IS NOT NULL AND u.quotex_ssid != '' "
-                "AND l.is_active = 1 AND (l.expires_at IS NULL OR l.expires_at > ?) GROUP BY s",
+                "AND l.is_active = 1 AND (l.expires_at IS NULL OR l.expires_at > ?)",
                 (now_iso(),),
             ).fetchall()
             conn.close()
             for r in rows:
-                counts[r["s"]] = r["c"]
+                for sid in str(r["s"]).split(","):
+                    sid = sid.strip()
+                    if sid:
+                        counts[sid] = counts.get(sid, 0) + 1
         except Exception as e:
             print(f"[STRATEGY] subscribers error: {e}", flush=True)
         return counts
@@ -551,9 +560,9 @@ class QuotexCopyManager:
         conn.commit()
         conn.close()
 
-    async def _copy_all(self, followers, asset, direction, expiry, time_mode, bypass_cooldown=False):
+    async def _copy_all(self, followers, asset, direction, expiry, time_mode, bypass_cooldown=False, strategy=None):
         results = await asyncio.gather(
-            *[self.copy_to_follower(f, asset, direction, expiry, time_mode, bypass_cooldown) for f in followers],
+            *[self.copy_to_follower(f, asset, direction, expiry, time_mode, bypass_cooldown, strategy) for f in followers],
             return_exceptions=True,
         )
         return sum(1 for r in results if isinstance(r, dict) and r.get("success"))
@@ -610,7 +619,7 @@ class QuotexCopyManager:
             print(f"[SIGNAL] [{strategy}] {asset} {direction} -> {len(followers)} auto-traders", flush=True)
             if not followers:
                 return
-            copied = await self._copy_all(followers, asset, direction, expiry, "TIMER", bypass_cooldown=True)
+            copied = await self._copy_all(followers, asset, direction, expiry, "TIMER", bypass_cooldown=True, strategy=strategy)
             print(f"[SIGNAL] [{strategy}] Copied {copied}/{len(followers)}", flush=True)
             self._log_trade(asset, direction, 0, expiry, f"signal:{strategy}", copied)
             self._track(asyncio.create_task(self._refresh_after_trade(expiry, [f["license_key"] for f in followers])))

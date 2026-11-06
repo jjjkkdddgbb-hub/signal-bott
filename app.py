@@ -1159,6 +1159,27 @@ def admin_logout():
     return redirect(url_for("admin"))
 
 
-if __name__ == "__main__":
+# ==================== تشغيل السيرفر ====================
+
+_background_started = False
+
+def start_background_once():
+    global _background_started
+
+    if _background_started:
+        return
+
     copy_manager.start_background_loop()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
+    _background_started = True
+
+
+if __name__ == "__main__":
+    start_background_once()
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        threaded=True,
+        use_reloader=False
+    )
+

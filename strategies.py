@@ -59,13 +59,483 @@ STRATEGIES = [
         "scan": True,
     },
     {
-        "id": "waker_block",
-        "name": "ووكر بلوك",
-        "icon": "🧱",
-        "tagline": "أوردر بلوك + كسر الهيكل + إعادة اختبار",
-        "desc": "يجمع خمسة شروط في قرار واحد: منطقة أوردر بلوك، وكسر هيكل السوق، وإعادة اختبار المنطقة، وزخم السعر، وRSI. لا يدخل إلا إذا اجتمعت الشروط بدرجة كافية.",
-        "tags": ["صفقة 1 دقيقة", "يعتمد على هيكل السوق"],
-        "scan": True,
+# ──────────── ORDER BLOCK PRO+ (SMC + INDICATORS) ─────────────
+
+WAKER_THRESHOLD = 60
+
+
+def _ob_adx(df, n=14):
+    h, l, c = df["h"], df["l"], df["c"]
+    up = h.diff()
+    down = -l.diff()
+
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+
+    prev = c.shift(1)
+    tr = pd.concat([
+        h - l,
+        (h - prev).abs(),
+        (l - prev).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/n, adjust=False).mean().replace(0, np.nan)
+
+    plus_di = 100 * plus_dm.ewm(alpha=1/n, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1/n, adjust=False).mean() / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / (
+        plus_di + minus_di
+    ).replace(0, np.nan)
+
+    adx = dx.ewm(alpha=1/n, adjust=False).mean()
+
+    return float(adx.iloc[-1]) if (
+        len(adx) and np.isfinite(adx.iloc[-1])
+    ) else 0.0
+
+
+def _ob_stoch(df, n=14, smooth=3):
+    lo = df["l"].rolling(n).min()
+    hi = df["h"].rolling(n).max()
+
+    raw = 100 * (df["c"] - lo) / (hi - lo).replace(0, np.nan)
+
+    k = raw.rolling(smooth).mean()
+    d = k.rolling(smooth).mean()
+
+    if (
+        len(k) < 2
+        or not np.isfinite(k.iloc[-2:]).all()
+        or not np.isfinite(d.iloc[-2:]).all()
+    ):
+        return 50.0, False, False
+
+    cross_up = (
+        k.iloc[-2] <= d.iloc[-2]
+        and k.iloc[-1] > d.iloc[-1]
+    )
+
+    cross_down = (
+        k.iloc[-2] >= d.iloc[-2]
+        and k.iloc[-1] < d.iloc[-1]
+    )
+
+    return float(k.iloc[-1]), bool(cross_up), bool(cross_down)
+
+
+def _waker_block(df):
+    """
+    ORDER BLOCK PRO+
+    SMC + ICT + EMA + MACD + RSI + ADX + STOCHASTIC
+    ATR + BOLLINGER + LIQUIDITY SWEEP
+
+    لا توجد إشارة إلا بعد:
+    1- كسر الهيكل بإغلاق.
+    2- وجود أوردر بلوك صالح.
+    3- إعادة اختبار بالذيل.
+    4- شمعة رفض مؤكدة.
+    """
+
+    if len(df) < 70:
+        return None
+
+    o, h, l, c = (
+        df["o"], df["h"], df["l"], df["c"]
+    )
+
+    i = len(df) - 1
+    price = float(c.iloc[i])
+
+    # 1. ATR
+    prev_c = c.shift(1)
+
+    tr = pd.concat([
+        h - l,
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
+    ], axis=1).max(axis=1)
+
+    atr_s = tr.ewm(alpha=1/14, adjust=False).mean()
+    atr_now = float(atr_s.iloc[i])
+
+    if not np.isfinite(atr_now) or atr_now <= 0:
+        return None
+
+    # 2. البحث عن Order Block مع BOS مؤكد بالإغلاق
+    candidate = None
+    start = max(15, i - 22)
+
+    for j in range(i - 2, start - 1, -1):
+
+        prior_high = float(h.iloc[j-12:j].max())
+        prior_low = float(l.iloc[j-12:j].min())
+
+        body = abs(float(c.iloc[j]) - float(o.iloc[j]))
+        atr_j = float(atr_s.iloc[j])
+
+        if (
+            not np.isfinite(atr_j)
+            or atr_j <= 0
+            or body < atr_j
+        ):
+            continue
+
+        bullish_impulse = (
+            float(c.iloc[j]) > float(o.iloc[j])
+            and float(c.iloc[j]) > prior_high
+        )
+
+        bearish_impulse = (
+            float(c.iloc[j]) < float(o.iloc[j])
+            and float(c.iloc[j]) < prior_low
+        )
+
+        if not (bullish_impulse or bearish_impulse):
+            continue
+
+        # الشمعة المعاكسة قبل الاندفاع
+        prev_o = float(o.iloc[j-1])
+        prev_close = float(c.iloc[j-1])
+
+        if bullish_impulse and prev_close < prev_o:
+
+            direction = "CALL"
+            zone_top = prev_o
+            zone_bottom = float(l.iloc[j-1])
+
+            fvg = (
+                float(l.iloc[j+1])
+                > float(h.iloc[j-1])
+            )
+
+        elif bearish_impulse and prev_close > prev_o:
+
+            direction = "PUT"
+            zone_top = float(h.iloc[j-1])
+            zone_bottom = prev_o
+
+            fvg = (
+                float(h.iloc[j+1])
+                < float(l.iloc[j-1])
+            )
+
+        else:
+            continue
+
+        if zone_top <= zone_bottom:
+            continue
+
+        # يجب أن يلمس الذيل المنطقة الحالية
+        latest_low = float(l.iloc[i])
+        latest_high = float(h.iloc[i])
+
+        if not (
+            latest_low <= zone_top + atr_now * 0.05
+            and latest_high >= zone_bottom - atr_now * 0.05
+        ):
+            continue
+
+        candidate = {
+            "direction": direction,
+            "impulse": j,
+            "top": zone_top,
+            "bottom": zone_bottom,
+            "fvg": bool(fvg),
+        }
+
+        break
+
+    if candidate is None:
+        return None
+
+    bias = candidate["direction"]
+    zone_top = candidate["top"]
+    zone_bottom = candidate["bottom"]
+    impulse = candidate["impulse"]
+
+    # 3. صلاحية المنطقة
+    if i - impulse > 20:
+        return None
+
+    between = df.iloc[impulse + 2:i]
+
+    if len(between):
+
+        if bias == "CALL" and (
+            between["c"] < zone_bottom
+        ).any():
+            return None
+
+        if bias == "PUT" and (
+            between["c"] > zone_top
+        ).any():
+            return None
+
+    # 4. إعادة الاختبار بالذيل
+    op = float(o.iloc[i])
+    cl = float(c.iloc[i])
+    hi = float(h.iloc[i])
+    lo = float(l.iloc[i])
+
+    candle_range = max(hi - lo, 1e-12)
+
+    lower_wick = min(op, cl) - lo
+    upper_wick = hi - max(op, cl)
+
+    tolerance = atr_now * 0.05
+
+    wick_retest = (
+        lo <= zone_top + tolerance
+        and hi >= zone_bottom - tolerance
+    )
+
+    if not wick_retest:
+        return None
+
+    # 5. شمعة الرفض
+    if bias == "CALL":
+
+        rejection = (
+            cl > op
+            and cl >= zone_top
+            and lower_wick / candle_range >= 0.30
+        )
+
+        invalid = cl <= zone_bottom
+
+    else:
+
+        rejection = (
+            cl < op
+            and cl <= zone_bottom
+            and upper_wick / candle_range >= 0.30
+        )
+
+        invalid = cl >= zone_top
+
+    if invalid or not rejection:
+        return None
+
+    # 6. EMA 20 / EMA 50
+    ema20 = _ema(c, 20)
+    ema50 = _ema(c, 50)
+
+    if bias == "CALL":
+
+        trend_ok = (
+            ema20.iloc[i] > ema50.iloc[i]
+            and ema50.iloc[i] > ema50.iloc[i-4]
+        )
+
+    else:
+
+        trend_ok = (
+            ema20.iloc[i] < ema50.iloc[i]
+            and ema50.iloc[i] < ema50.iloc[i-4]
+        )
+
+    # 7. MACD
+    macd_line = _ema(c, 12) - _ema(c, 26)
+    macd_signal = _ema(macd_line, 9)
+    macd_hist = macd_line - macd_signal
+
+    if bias == "CALL":
+
+        macd_ok = (
+            macd_hist.iloc[i] > 0
+            and macd_hist.iloc[i] > macd_hist.iloc[i-1]
+        )
+
+    else:
+
+        macd_ok = (
+            macd_hist.iloc[i] < 0
+            and macd_hist.iloc[i] < macd_hist.iloc[i-1]
+        )
+
+    # 8. RSI 14
+    rsi_v = float(_rsi(c, 14).iloc[i])
+
+    rsi_ok = (
+        50 <= rsi_v <= 72
+        if bias == "CALL"
+        else 28 <= rsi_v <= 50
+    )
+
+    # 9. ADX + DI
+    adx_v = _ob_adx(df, 14)
+
+    up_move = h.diff()
+    down_move = -l.diff()
+
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0),
+        0.0
+    )
+
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0),
+        0.0
+    )
+
+    atr_di = tr.ewm(
+        alpha=1/14,
+        adjust=False
+    ).mean().replace(0, np.nan)
+
+    plus_di = (
+        100 * plus_dm.ewm(
+            alpha=1/14, adjust=False
+        ).mean() / atr_di
+    )
+
+    minus_di = (
+        100 * minus_dm.ewm(
+            alpha=1/14, adjust=False
+        ).mean() / atr_di
+    )
+
+    di_plus_now = (
+        float(plus_di.iloc[i])
+        if np.isfinite(plus_di.iloc[i])
+        else np.nan
+    )
+
+    di_minus_now = (
+        float(minus_di.iloc[i])
+        if np.isfinite(minus_di.iloc[i])
+        else np.nan
+    )
+
+    if (
+        not np.isfinite(di_plus_now)
+        or not np.isfinite(di_minus_now)
+    ):
+        di_ok = False
+
+    elif bias == "CALL":
+        di_ok = di_plus_now > di_minus_now
+
+    else:
+        di_ok = di_minus_now > di_plus_now
+
+    adx_ok = adx_v >= 15 and di_ok
+
+    # 10. Stochastic
+    stoch_v, stoch_up, stoch_down = _ob_stoch(df)
+
+    stoch_ok = (
+        stoch_up or stoch_v >= 50
+        if bias == "CALL"
+        else stoch_down or stoch_v <= 50
+    )
+
+    # 11. Fair Value Gap
+    fvg_ok = candidate["fvg"]
+
+    # 12. Liquidity Sweep
+    prior_low = float(l.iloc[i-10:i].min())
+    prior_high = float(h.iloc[i-10:i].max())
+
+    sweep_ok = (
+        lo < prior_low and cl > prior_low
+        if bias == "CALL"
+        else hi > prior_high and cl < prior_high
+    )
+
+    # 13. Bollinger Bands
+    bb_std = c.rolling(20).std(ddof=0)
+
+    bb_width_pct = float(
+        4 * bb_std.iloc[i] / max(abs(price), 1e-12) * 100
+    )
+
+    volatility_ok = (
+        np.isfinite(bb_width_pct)
+        and bb_width_pct >= 0.015
+    )
+
+    # 14. ICT Premium / Discount
+    range_high = float(
+        h.iloc[max(0, i-49):i].max()
+    )
+
+    range_low = float(
+        l.iloc[max(0, i-49):i].min()
+    )
+
+    equilibrium = (range_high + range_low) / 2
+
+    premium_discount_ok = (
+        price <= equilibrium
+        if bias == "CALL"
+        else price >= equilibrium
+    )
+
+    # 15. تقييم اجتماع الشروط
+    score = 20
+
+    score += 10 if trend_ok else 0
+    score += 10 if macd_ok else 0
+    score += 8 if rsi_ok else 0
+    score += 8 if adx_ok else 0
+    score += 6 if stoch_ok else 0
+    score += 5 if fvg_ok else 0
+    score += 5 if sweep_ok else 0
+    score += 4 if volatility_ok else 0
+    score += 5 if premium_discount_ok else 0
+
+    score = int(min(score, 100))
+
+    if score < WAKER_THRESHOLD:
+        return None
+
+    confirmations = []
+
+    if trend_ok:
+        confirmations.append("EMA20/50")
+
+    if macd_ok:
+        confirmations.append("MACD")
+
+    if rsi_ok:
+        confirmations.append("RSI")
+
+    if adx_ok:
+        confirmations.append("ADX/DI")
+
+    if stoch_ok:
+        confirmations.append("Stochastic")
+
+    if fvg_ok:
+        confirmations.append("FVG")
+
+    if sweep_ok:
+        confirmations.append("Liquidity Sweep")
+
+    if volatility_ok:
+        confirmations.append("Bollinger")
+
+    if premium_discount_ok:
+        confirmations.append("Premium/Discount")
+
+    why = (
+        "ORDER BLOCK PRO+ | BOS بإغلاق | "
+        "Wick Retest + Rejection | "
+        + ("صاعد" if bias == "CALL" else "هابط")
+        + " | تأكيد: "
+        + ", ".join(confirmations)
+    )
+
+    return {
+        "dir": "call" if bias == "CALL" else "put",
+        "score": score,
+        "why": why
+    }
+
+# ───────────── END ORDER BLOCK PRO+ ─────────────
+
     },
 ]
 

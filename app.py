@@ -1162,3 +1162,75 @@ def admin_logout():
 if __name__ == "__main__":
     copy_manager.start_background_loop()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
+
+
+... MF.. # ==============================
+# OSCAR SERVER STABILITY BOOST
+# ==============================
+
+import logging
+import time
+import threading
+import os
+import sys
+import faulthandler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler("server_health.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger("OscarServer")
+faulthandler.enable()
+
+SERVER_START_TIME = time.time()
+SERVER_HEALTH = {
+    "status": "running",
+    "errors": 0,
+    "started_at": SERVER_START_TIME
+}
+
+def oscar_health_check():
+    while True:
+        try:
+            uptime = int(time.time() - SERVER_START_TIME)
+            logger.info("Server health OK | Uptime: %s seconds", uptime)
+            time.sleep(60)
+        except Exception:
+            SERVER_HEALTH["errors"] += 1
+            logger.exception("Health check error")
+            time.sleep(10)
+
+def oscar_safe_execute(function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except Exception:
+        SERVER_HEALTH["errors"] += 1
+        logger.exception("Execution error")
+        raise
+
+def oscar_server_status():
+    return {
+        "status": SERVER_HEALTH["status"],
+        "uptime": int(time.time() - SERVER_START_TIME),
+        "errors": SERVER_HEALTH["errors"]
+    }
+
+def oscar_start_monitor():
+    thread = threading.Thread(
+        target=oscar_health_check,
+        daemon=True,
+        name="OscarHealthMonitor"
+    )
+    thread.start()
+    logger.info("Oscar stability monitor started")
+
+oscar_start_monitor()
+
+# ==============================
+# END OSCAR STABILITY BOOST
+# ==============================

@@ -1,0 +1,814 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import time
+import hashlib
+import secrets
+import json as json_lib
+from functools import wraps
+from flask import (
+    Flask, render_template, request, redirect,
+    url_for, session, flash, jsonify, make_response, Response
+)
+from database import (
+    init_db, get_db, get_setting, set_setting, get_secret_setting,
+    set_secret_setting, save_user_session, clear_user_session, db_info,
+    get_events, last_event_id,
+)
+from license_manager import (
+    generate_key, validate_key, get_all_licenses,
+    deactivate_key, reactivate_key, delete_key, reset_device,
+    is_key_valid, KEY_DURATION_OPTIONS,
+)
+from quotex_manager import copy_manager
+from assets import OTC_ASSETS, REAL_ASSETS, EXPIRY_OPTIONS
+from notify import send_telegram_text, telegram_configured
+import strategies
+
+app = Flask(__name__)
+
+def _make_secret_key():
+    explicit = (os.environ.get("FLASK_SECRET_KEY") or "").strip()
+    if explicit:
+        return explicit
+    base = os.environ.get("ENCRYPTION_KEY") or secrets.token_hex(32)
+    return hashlib.sha256(("flask-session:" + base).encode()).hexdigest()
+
+app.secret_key = _make_secret_key()
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_API_TOKEN = (os.environ.get("ADMIN_API_TOKEN") or "").strip()
+DEVICE_COOKIE = "oscar_device"
+APK_DOWNLOAD_URL = os.environ.get("APK_DOWNLOAD_URL", "#")
+
+try:
+    init_db()
+except Exception as _e:
+    print(f"[APP] init_db failed: {_e}", flush=True)
+
+_attempts = {}
+
+def too_many_attempts(bucket, limit=8, window=600):
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "?").split(",")[0].strip()
+    now = time.time()
+    k = f"{bucket}:{ip}"
+    hits = [t for t in _attempts.get(k, []) if now - t < window]
+    if len(hits) >= limit:
+        _attempts[k] = hits
+        return True
+    hits.append(now)
+    _attempts[k] = hits
+    return False
+
+@app.after_request
+def add_headers(response):
+    if request.path.startswith("/admin") or request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+
+@app.errorhandler(Exception)
+def on_error(e):
+    code = getattr(e, "code", 500)
+    if not isinstance(code, int):
+        code = 500
+    if code == 404:
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        return redirect(url_for("index"))
+    print(f"[ERROR] {request.path}: {type(e).__name__}: {e}", flush=True)
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "حدث خطأ في الخادم، حاول بعد قليل"}), 500
+    return (
+        "<meta charset='utf-8'><body style='font-family:sans-serif;background:#0b1220;color:#e8eefc;" 
+        "text-align:center;padding:60px'><h2>حدث خطأ مؤقت</h2>" 
+        "<p>أعد تحميل الصفحة بعد لحظات.</p><p><a style='color:#e3b341' href='/'>العودة للرئيسية</a></p>", 500)
+
+_DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+WEB_USER_LOGIN = os.environ.get("WEB_USER_LOGIN", "0") == "1"
+
+@app.before_request
+def _device_guard():
+    p = request.path
+    if request.method == "OPTIONS": return None
+    if p.startswith("/api/app/"):
+        key = p.rstrip("/").split("/")[-1].strip().upper()
+    elif p == "/api/link":
+        key = str((request.get_json(silent=True) or {}).get("license_key", "")).strip().upper()
+    else: return None
+    if not key: return None
+    dev = (request.headers.get("X-Device-Id") or "").strip()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT device_ip FROM licenses WHERE key = ?", (key,)).fetchone()
+        if row is None: return None
+        if not _DEVICE_RE.match(dev): return jsonify({"ok": False, "error": "حدّث تطبيق Oskarix إلى آخر نسخة", "device_locked": True}), 403
+        bound = row["device_ip"] or ""
+        if not bound:
+            conn.execute("UPDATE licenses SET device_ip = ? WHERE key = ? AND (device_ip IS NULL OR device_ip = '')", (dev, key))
+            conn.commit()
+            bound = (conn.execute("SELECT device_ip FROM licenses WHERE key = ?", (key,)).fetchone()["device_ip"]) or ""
+    finally:
+        conn.close()
+    if bound != dev: return jsonify({"ok": False, "error": "هذا المفتاح مستخدم على جهاز آخر", "device_locked": True}), 403
+    return None
+
+def clear_user_cache(user_id):
+    try: copy_manager.clear_cache(user_id)
+    except Exception: pass
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        wants_json = request.path.startswith("/api/")
+        key = session.get("license_key")
+        if not key:
+            if wants_json: return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return redirect(url_for("index"))
+        ok, msg = is_key_valid(key)
+        if not ok:
+            session.clear()
+            if wants_json: return jsonify({"ok": False, "error": msg}), 401
+            flash(msg, "error")
+            return redirect(url_for("index"))
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("is_admin"): return redirect(url_for("admin"))
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_api(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if ADMIN_API_TOKEN:
+            given = request.headers.get("X-Admin-Token", "")
+            if not (session.get("is_admin") or secrets.compare_digest(given, ADMIN_API_TOKEN)):
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def get_user(key):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE license_key = ?", (key,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def ensure_user(key):
+    user = get_user(key)
+    if user is None:
+        conn = get_db()
+        conn.execute("INSERT OR IGNORE INTO users (license_key) VALUES (?)", (key,))
+        conn.commit()
+        conn.close()
+        user = get_user(key)
+    return user
+
+def build_user_info(key):
+    user = ensure_user(key)
+    return {"ok": True, "key": key, "linked": bool(user.get("quotex_ssid") or user.get("quotex_cookies")), "email": user.get("quotex_email") or "", "account_type": user.get("account_type") or "demo", "trade_mode": user.get("trade_mode") or "percent", "trade_value": float(user.get("trade_value") or 1.0), "max_loss_value": float(user.get("max_loss_value") or 0), "max_profit_value": float(user.get("max_profit_value") or 0), "is_copying": bool(user.get("is_copying")), "is_auto_trading": bool(user.get("is_auto_trading")), "settings_locked": bool(user.get("settings_locked")), "start_balance": user.get("start_balance"), "notification": user.get("last_notification") or "", "admin_auto_enabled": get_setting("admin_auto_enabled", "1") == "1", "strategy": strategies.parse_list(user.get("strategy"))[0], "selected_strategies": strategies.parse_list(user.get("strategy")), "strategies": strategies.public_list(), "rest_mode": get_setting("quotex_rest", "0") == "1", "last_event_id": last_event_id(user["id"]), "background_version": get_setting("app_background_version", "0")}
+
+def do_save_and_enable(key, data):
+    try:
+        account_type = data.get("account_type", "demo")
+        trade_mode = data.get("trade_mode", "percent")
+        trade_value = float(data.get("trade_value", 1.0))
+        max_loss_value = float(data.get("max_loss_value", 0))
+        max_profit_value = float(data.get("max_profit_value", 0))
+        enable_type = data.get("enable_type", "copy")
+        raw_strats = data.get("strategies")
+        if not raw_strats: raw_strats = data.get("strategy") or strategies.DEFAULT_STRATEGY
+        selected = strategies.parse_list(raw_strats)
+    except (ValueError, TypeError): return {"ok": False, "error": "قيم غير صحيحة"}, 400
+    if account_type not in ("demo", "live"): account_type = "demo"
+    if trade_mode not in ("percent", "fixed"): trade_mode = "percent"
+    if enable_type not in ("copy", "auto"): enable_type = "copy"
+    if trade_mode == "percent":
+        if trade_value < 0.1 or trade_value > 100: return {"ok": False, "error": "النسبة يجب أن تكون بين 0.1 و 100"}, 400
+    elif trade_value < 1: return {"ok": False, "error": "المبلغ الثابت 1$ على الأقل"}, 400
+    if max_loss_value < 0 or max_profit_value < 0: return {"ok": False, "error": "القيم يجب أن تكون موجبة"}, 400
+    if get_setting("quotex_rest", "0") == "1": return {"ok": False, "error": "🛠️ السيرفر في وضع الراحة مؤقتاً. حاول لاحقاً."}, 400
+    if enable_type == "auto" and get_setting("admin_auto_enabled", "1") != "1": return {"ok": False, "error": "التداول الآلي معطّل حالياً من قبل المدير"}, 400
+    if enable_type == "auto":
+        off = [strategies.name_of(s) for s in selected if not strategies.is_enabled(s)]
+        if off: return {"ok": False, "error": "هذه الاستراتيجيات معطّلة حالياً من المدير: " + ", ".join(off) + ". ألغِ اختيارها أو اختر غيرها."}, 400
+    else: selected = [strategies.DEFAULT_STRATEGY]
+    strategy = strategies.join_list(selected)
+    user = get_user(key)
+    if not user: return {"ok": False, "error": "المستخدم غير موجود"}, 400
+    if not (user.get("quotex_ssid") or user.get("quotex_cookies")): return {"ok": False, "error": "اربط حساب Quotex أولاً"}, 400
+    is_copying = 1 if enable_type == "copy" else 0
+    is_auto_trading = 1 if enable_type == "auto" else 0
+    conn = get_db()
+    conn.execute("UPDATE users SET account_type = ? WHERE license_key = ?", (account_type, key))
+    conn.commit()
+    conn.close()
+    fresh_user = get_user(key)
+    clear_user_cache(user["id"])
+    try: stats = copy_manager.run_async(copy_manager.get_user_stats(fresh_user), timeout=90)
+    except Exception as e: return {"ok": False, "error": f"تعذر الاتصال بالحساب: {e}"}, 400
+    pending = False
+    if not stats.get("ok"):
+        err = stats.get("error", "تعذر الاتصال")
+        if _is_network_block(err): pending = True; new_start = None
+        else: return {"ok": False, "error": f"تعذر الاتصال بالحساب: {err}"}, 400
+    else:
+        if stats["balance"] <= 0:
+            label = "الحقيقي" if account_type == "live" else "التجريبي"
+            return {"ok": False, "error": f"رصيد حسابك {label} صفر. أضف أموالاً أو غيّر نوع الحساب"}, 400
+        new_start = stats["balance"]
+    conn = get_db()
+    conn.execute("UPDATE users SET trade_mode = ?, trade_value = ?, max_loss_value = ?, max_profit_value = ?, settings_locked = 1, is_copying = ?, is_auto_trading = ?, start_balance = ?, last_notification = NULL, strategy = ?, balance_version = balance_version + 1 WHERE license_key = ?", (trade_mode, trade_value, max_loss_value, max_profit_value, is_copying, is_auto_trading, new_start, strategy, key))
+    conn.commit()
+    conn.close()
+    clear_user_cache(user["id"])
+    return {"ok": True, "is_copying": bool(is_copying), "is_auto_trading": bool(is_auto_trading), "start_balance": new_start, "balance": new_start or 0, "pending": pending, "account_type": account_type, "strategy": selected[0], "selected_strategies": selected}, 200
+
+def do_stop(key):
+    user = get_user(key)
+    if not user: return {"ok": False, "error": "المستخدم غير موجود"}, 400
+    conn = get_db()
+    conn.execute("UPDATE users SET is_copying = 0, is_auto_trading = 0, settings_locked = 0, start_balance = NULL, last_notification = NULL, balance_version = balance_version + 1 WHERE license_key = ?", (key,))
+    conn.commit()
+    conn.close()
+    clear_user_cache(user["id"])
+    return {"ok": True}, 200
+
+def do_clear_notification(key):
+    user = get_user(key)
+    if user:
+        conn = get_db()
+        conn.execute("UPDATE users SET last_notification = NULL WHERE license_key = ?", (key,))
+        conn.commit()
+        conn.close()
+        clear_user_cache(user["id"])
+    return {"ok": True}, 200
+
+def do_stats(key, requested_account=""):
+    user = get_user(key)
+    if not user or (not user["quotex_ssid"] and not user["quotex_cookies"]): return {"ok": False, "error": "غير مرتبط"}, 400
+    requested_account = (requested_account or "").strip().lower()
+    view_user = dict(user)
+    if requested_account in ("demo", "live"): view_user["account_type"] = requested_account
+    stats = dict(copy_manager.fetch_stats_sync(view_user))
+    stats["is_copying"] = bool(user.get("is_copying"))
+    stats["is_auto_trading"] = bool(user.get("is_auto_trading"))
+    stats["notification"] = user.get("last_notification") or ""
+    stats["strategy"] = strategies.parse_list(user.get("strategy"))[0]
+    return stats, 200
+
+def do_unlink(key):
+    user = get_user(key)
+    clear_user_session(key)
+    if user: clear_user_cache(user["id"])
+    return {"ok": True}, 200
+
+def _respond(result):
+    payload, status = result
+    return jsonify(payload), status
+
+@app.route("/health")
+def health(): return "ok"
+
+@app.route("/")
+def index():
+    if session.get("license_key"): return redirect(url_for("dashboard"))
+    return render_template("index.html", apk_url=APK_DOWNLOAD_URL)
+
+@app.route("/activate", methods=["POST"])
+def activate():
+    if too_many_attempts("activate"):
+        flash("محاولات كثيرة. انتظر بضع دقائق ثم حاول مرة أخرى.", "error")
+        return redirect(url_for("index"))
+    key = request.form.get("license_key", "").strip().upper()
+    device_id = request.cookies.get(DEVICE_COOKIE) or secrets.token_hex(16)
+    result = validate_key(key, device_id=device_id)
+    if not result["success"]:
+        flash(result["error"], "error")
+        return redirect(url_for("index"))
+    session["license_key"] = key
+    session.permanent = True
+    ensure_user(key)
+    resp = make_response(redirect(url_for("dashboard")))
+    resp.set_cookie(DEVICE_COOKIE, device_id, max_age=60 * 60 * 24 * 365 * 2, httponly=True, samesite="Lax", secure=request.headers.get("X-Forwarded-Proto") == "https")
+    return resp
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    key = session["license_key"]
+    ensure_user(key)
+    return render_template("dashboard.html", license_key=key, apk_url=APK_DOWNLOAD_URL)
+
+@app.route("/app_login/<key>")
+def app_login(key):
+    if not WEB_USER_LOGIN: return "<meta charset='utf-8'><h2>⚠️ الدخول من المتصفح غير متاح</h2><p>استخدم تطبيق Oskarix على جهازك.</p>", 403
+    key = key.strip().upper()
+    ok, msg = is_key_valid(key)
+    if not ok: return f"<h2>⚠️ خطأ</h2><p>{msg}</p>", 403
+    session["license_key"] = key
+    session.permanent = True
+    ensure_user(key)
+    return redirect(url_for("dashboard"))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+@app.route("/api/me")
+@login_required
+def api_me(): return jsonify(build_user_info(session["license_key"]))
+
+@app.route("/api/start", methods=["POST"])
+@login_required
+def api_start(): return _respond(do_save_and_enable(session["license_key"], request.get_json(silent=True) or {}))
+
+@app.route("/api/stop", methods=["POST"])
+@login_required
+def api_stop(): return _respond(do_stop(session["license_key"]))
+
+@app.route("/api/clear_notification", methods=["POST"])
+@login_required
+def api_clear_notification(): return _respond(do_clear_notification(session["license_key"]))
+
+@app.route("/api/stats")
+@login_required
+def api_stats(): return _respond(do_stats(session["license_key"], request.args.get("account", "")))
+
+@app.route("/api/unlink", methods=["POST"])
+@login_required
+def api_unlink(): return _respond(do_unlink(session["license_key"]))
+
+def _app_key_or_error(key):
+    key = key.strip().upper()
+    ok, msg = is_key_valid(key)
+    if not ok: return None, (jsonify({"ok": False, "error": msg}), 403)
+    return key, None
+
+@app.route("/api/app/user_info/<key>")
+def api_app_user_info(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    info = build_user_info(key)
+    info.pop("key", None)
+    return jsonify(info)
+
+@app.route("/api/app/events/<key>")
+def api_app_events(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    user = ensure_user(key)
+    after = request.args.get("after", default=0, type=int)
+    out = []
+    for e in get_events(user["id"], after, 40):
+        out.append({"id": e["id"], "kind": e["kind"], "asset": e["asset"], "direction": e["direction"], "amount": e["amount"], "strategy": e["strategy"], "strategy_name": strategies.name_of(e["strategy"]) if e["strategy"] else "نسخ صفقات المدير", "source": e["source"], "note": e["note"], "at": e["created_at"]})
+    return jsonify({"ok": True, "events": out, "latest_id": last_event_id(user["id"])})
+
+@app.route("/api/app/background/<key>")
+def api_app_background(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    raw = get_setting("app_background", "")
+    if not raw or "," not in raw: return jsonify({"ok": False, "error": "no_background"}), 404
+    import base64
+    head, b64 = raw.split(",", 1)
+    mime = head.split(";")[0].replace("data:", "") or "image/jpeg"
+    try: data = base64.b64decode(b64)
+    except Exception: return jsonify({"ok": False, "error": "bad_background"}), 404
+    resp = Response(data, mimetype=mime)
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    return resp
+
+@app.route("/api/app/save_and_enable/<key>", methods=["POST"])
+def api_app_save_and_enable(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    return _respond(do_save_and_enable(key, request.get_json(silent=True) or {}))
+
+@app.route("/api/app/stop_trading/<key>", methods=["POST"])
+def api_app_stop_trading(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    return _respond(do_stop(key))
+
+@app.route("/api/app/clear_notification/<key>", methods=["POST"])
+def api_app_clear_notification(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    return _respond(do_clear_notification(key))
+
+@app.route("/api/app/session_stats/<key>")
+def api_app_session_stats(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    return _respond(do_stats(key, request.args.get("account", "")))
+
+@app.route("/api/app/unlink/<key>", methods=["POST"])
+def api_app_unlink(key):
+    key, err = _app_key_or_error(key)
+    if err: return err
+    return _respond(do_unlink(key))
+
+def _is_network_block(err):
+    e = str(err or "").lower()
+    return any(w in e for w in ("rate_limited", "429", "rejected", "cooldown", "timeout", "refused", "rest_mode"))
+
+@app.route("/api/link", methods=["POST"])
+def api_link():
+    data = request.get_json(silent=True) or {}
+    key = str(data.get("license_key", "")).strip().upper()
+    ssid = str(data.get("ssid", "")).strip()
+    cookies = str(data.get("cookies", "")).strip()
+    email = str(data.get("email", "")).strip()
+    ok, msg = is_key_valid(key)
+    if not ok: return jsonify({"ok": False, "error": msg}), 403
+    if not ssid and not cookies: return jsonify({"ok": False, "error": "لا توجد جلسة"}), 400
+    ensure_user(key)
+    try: check = copy_manager.run_async(copy_manager.test_session(ssid or "", cookies or None), timeout=90)
+    except Exception as e: check = {"success": False, "error": str(e)}
+    unverified = False
+    if not check.get("success"):
+        err = check.get("error", "الجلسة لا تعمل")
+        if len(ssid) >= 25 and _is_network_block(err): unverified = True
+        else: return jsonify({"ok": False, "error": err}), 400
+    final_ssid = check.get("ssid", "") or ssid
+    user = get_user(key)
+    save_user_session(key, final_ssid, cookies, email)
+    if user: clear_user_cache(user["id"])
+    return jsonify({"ok": True, "ssid_extracted": bool(final_ssid and not ssid), "unverified": unverified})
+
+@app.route("/api/admin/is_linked")
+@admin_api
+def api_admin_is_linked():
+    ssid = get_secret_setting("master_ssid")
+    is_valid_ssid = bool(ssid and not (ssid.startswith('<') or 'object at 0x' in ssid))
+    return jsonify({"linked": is_valid_ssid, "account_type": get_setting("master_account_type", "demo")})
+
+@app.route("/api/admin/link_master", methods=["POST"])
+@admin_api
+def api_admin_link_master():
+    data = request.get_json(silent=True) or {}
+    ssid = str(data.get("ssid", "")).strip()
+    cookies = str(data.get("cookies", "")).strip()
+    if not ssid and not cookies: return jsonify({"ok": False, "error": "لا توجد جلسة"}), 400
+    try: check = copy_manager.run_async(copy_manager.test_session(ssid or "", cookies or None), timeout=90)
+    except Exception as e: check = {"success": False, "error": str(e)}
+    unverified = False
+    if not check.get("success"):
+        err = check.get("error", "الجلسة لا تعمل")
+        if len(ssid) >= 25 and _is_network_block(err): unverified = True
+        else: return jsonify({"ok": False, "error": err}), 400
+    final_ssid = check.get("ssid", "") or ssid
+    set_secret_setting("master_ssid", final_ssid)
+    set_secret_setting("master_cookies", cookies)
+    print(f"[LINK_MASTER] Saved ssid prefix={final_ssid[:20] if final_ssid else 'none'}", flush=True)
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/raw", methods=["POST"])
+@admin_api
+def api_admin_raw():
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get("raw", ""))[:600]
+    print(f"[RAW] {raw[:120]}", flush=True)
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/realtime_trade", methods=["POST"])
+@admin_api
+def api_admin_realtime_trade():
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get("raw", "")).strip()
+    if raw:
+        m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw)
+        if not m: return jsonify({"ok": False, "error": "no json"}), 400
+        try: p = json_lib.loads(m.group(0))
+        except Exception as e: print(f"[REALTIME] JSON parse error: {e}", flush=True); return jsonify({"ok": False, "error": "parse fail"}), 400
+    else: p = data
+    asset = p.get("asset") or p.get("symbol") or p.get("instrument") or p.get("pair")
+    amount = p.get("amount") or p.get("sum") or p.get("price") or p.get("investment")
+    action = p.get("action") if "action" in p else p.get("direction", p.get("side"))
+    expiry = p.get("time") or p.get("duration") or p.get("expiry") or 60
+    if not asset or not amount: return jsonify({"ok": False, "error": "missing fields"}), 400
+    dir_str = None
+    if action in (1, "call", "up", True): dir_str = "call"
+    elif action in (-1, "put", "down", False): dir_str = "put"
+    if not dir_str: return jsonify({"ok": False, "error": "bad direction"}), 400
+    try:
+        amount_f = float(amount)
+        expiry_i = int(expiry)
+    except (ValueError, TypeError): return jsonify({"ok": False, "error": "bad numbers"}), 400
+    try:
+        result = copy_manager.run_async(copy_manager.broadcast_trade(asset, dir_str, amount_f, expiry_i, "TIMER", skip_master=True), timeout=300)
+    except Exception as e: print(f"[REALTIME] Exception: {e}", flush=True); result = {"success": False, "error": str(e)}
+    copied = result.get("copied_count", 0)
+    total = result.get("total_followers", 0)
+    if result.get("success"): return jsonify({"ok": True, "copied": copied, "total": total})
+    return jsonify({"ok": False, "error": result.get("error", "فشل")}), 400
+
+@app.route("/api/admin/toggles")
+@admin_api
+def api_admin_toggles():
+    return jsonify({"ok": True, "auto_enabled": get_setting("admin_auto_enabled", "1") == "1", "bot_enabled": get_setting("admin_bot_enabled", "1") == "1", "strategies": {s["id"]: s["enabled"] for s in strategies.public_list()}})
+
+@app.route("/api/admin/toggle_strategy", methods=["POST"])
+@admin_api
+def api_admin_toggle_strategy():
+    data = request.get_json(silent=True) or {}
+    sid = str(data.get("strategy", ""))
+    if not strategies.is_valid(sid): return jsonify({"ok": False, "error": "استراتيجية غير معروفة"}), 400
+    enabled = bool(data.get("enabled"))
+    set_setting(f"strategy_enabled_{sid}", "1" if enabled else "0")
+    stopped = 0
+    if not enabled: stopped = _stop_auto_users(f"⚠️ أوقف المدير استراتيجية «{strategies.name_of(sid)}». اختر استراتيجية أخرى ثم شغّل من جديد.", sid)
+    return jsonify({"ok": True, "strategy": sid, "enabled": enabled, "stopped": stopped})
+
+@app.route("/api/admin/set_auto", methods=["POST"])
+@admin_api
+def api_admin_set_auto():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    set_setting("admin_auto_enabled", "1" if enabled else "0")
+    stopped = 0
+    if not enabled: stopped = _stop_auto_users("⚠️ تم إيقاف التداول الآلي من قبل المدير. يمكنك تشغيله من جديد عند إعادة تفعيله.")
+    return jsonify({"ok": True, "enabled": enabled, "stopped": stopped})
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST":
+        if too_many_attempts("admin", limit=6):
+            flash("محاولات كثيرة. انتظر بضع دقائق.", "error")
+            return render_template("admin_login.html")
+        given = request.form.get("password", "")
+        if ADMIN_PASSWORD and secrets.compare_digest(given, ADMIN_PASSWORD):
+            session["is_admin"] = True
+            session.permanent = True
+            return redirect(url_for("admin_panel"))
+        flash("كلمة المرور غير صحيحة", "error")
+    if session.get("is_admin"): return redirect(url_for("admin_panel"))
+    return render_template("admin_login.html", admin_configured=bool(ADMIN_PASSWORD))
+
+def _safe_setting(key, default=""):
+    try: return get_setting(key, default) or default
+    except Exception: return default
+
+def system_status():
+    di = db_info()
+    try: master_linked = bool(get_secret_setting("master_ssid"))
+    except Exception: master_linked = False
+    return {"db_mode": di["mode"], "db_configured": di["configured"], "db_error": di["error"], "master_linked": master_linked, "master_account": _safe_setting("master_account_type", "demo"), "telegram_ok": telegram_configured(), "signals_env": os.environ.get("ENABLE_SIGNALS", "false").lower() == "true", "bot_status": _safe_setting("bot_status", ""), "bot_status_at": _safe_setting("bot_status_at", ""), "last_signal": _safe_setting("last_signal", ""), "last_signal_at": _safe_setting("last_signal_at", ""), "quotex_block_min": copy_manager.rate_limit_remaining() // 60 + (1 if copy_manager.rate_limit_remaining() else 0), "api_open": not ADMIN_API_TOKEN, "rest_mode": _safe_setting("quotex_rest", "0") == "1", "weak_password": len(ADMIN_PASSWORD) < 10}
+
+@app.route("/admin/panel")
+@admin_required
+def admin_panel():
+    conn = get_db()
+    total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    linked_users = conn.execute("SELECT COUNT(*) AS c FROM users WHERE quotex_ssid IS NOT NULL AND quotex_ssid != ''").fetchone()["c"]
+    active_copy = conn.execute("SELECT COUNT(*) AS c FROM users WHERE is_copying = 1").fetchone()["c"]
+    active_auto = conn.execute("SELECT COUNT(*) AS c FROM users WHERE is_auto_trading = 1").fetchone()["c"]
+    users_list = conn.execute("SELECT license_key, quotex_email, quotex_ssid, account_type, is_copying, is_auto_trading, strategy, trade_mode, trade_value, start_balance FROM users ORDER BY created_at DESC").fetchall()
+    logs = conn.execute("SELECT * FROM trade_logs ORDER BY created_at DESC LIMIT 30").fetchall()
+    conn.close()
+    return render_template("admin.html", licenses=get_all_licenses(), total_users=total_users, linked_users=linked_users, active_copy=active_copy, active_auto=active_auto, users_list=[dict(u) for u in users_list], logs=[dict(l) for l in logs], otc_assets=OTC_ASSETS, real_assets=REAL_ASSETS, expiry_options=EXPIRY_OPTIONS, key_duration_options=KEY_DURATION_OPTIONS, admin_auto_enabled=get_setting("admin_auto_enabled", "1") == "1", admin_bot_enabled=get_setting("admin_bot_enabled", "1") == "1", rest_mode=get_setting("quotex_rest", "0") == "1", has_background=bool(get_setting("app_background", "")), strategy_list=strategies.public_list(), strategy_counts=copy_manager.strategy_subscribers(), system=system_status(), tab=request.args.get("tab", "status"))
+
+def _back(tab="status"): return redirect(url_for("admin_panel", tab=tab))
+
+@app.route("/admin/create_key", methods=["POST"])
+@admin_required
+def admin_create_key():
+    try: hours = int(request.form.get("hours", 24))
+    except ValueError: hours = 24
+    result = generate_key(hours)
+    if result["success"]: flash(f"✅ تم إنشاء المفتاح: {result['key']}", "success")
+    else: flash(f"❌ فشل: {result['error']}", "error")
+    return _back("keys")
+
+@app.route("/admin/delete_key", methods=["POST"])
+@admin_required
+def admin_delete_key():
+    key = request.form.get("key", "").strip()
+    if not key: flash("المفتاح مطلوب", "error"); return _back("keys")
+    user = get_user(key)
+    delete_key(key)
+    if user: clear_user_cache(user["id"])
+    flash(f"✅ تم حذف المفتاح {key} وكل بيانات المستخدم نهائياً", "success")
+    return _back("keys")
+
+@app.route("/admin/toggle_key", methods=["POST"])
+@admin_required
+def admin_toggle_key():
+    key = request.form.get("key", "")
+    action = request.form.get("action", "")
+    if action == "activate": reactivate_key(key); flash(f"✅ تم تفعيل المفتاح {key}", "success")
+    else:
+        deactivate_key(key)
+        user = get_user(key)
+        if user:
+            conn = get_db()
+            conn.execute("UPDATE users SET is_copying = 0, is_auto_trading = 0, last_notification = ?, balance_version = balance_version + 1 WHERE license_key = ?", ("⚠️ تم تعطيل مفتاحك مؤقتاً من قبل المدير", key))
+            conn.commit()
+            conn.close()
+        flash(f"⛔ تم إيقاف المفتاح {key} مؤقتاً", "success")
+    return _back("keys")
+
+@app.route("/admin/reset_device", methods=["POST"])
+@admin_required
+def admin_reset_device():
+    reset_device(request.form.get("key", ""))
+    flash("✅ تم إعادة تعيين الجهاز", "success")
+    return _back("keys")
+
+@app.route("/admin/clear_master", methods=["POST"])
+@admin_required
+def admin_clear_master():
+    set_secret_setting("master_ssid", "")
+    set_secret_setting("master_cookies", "")
+    set_setting("master_email", "")
+    copy_manager.master_client = None
+    flash("✅ تم فصل حساب المشرف", "success")
+    return _back("status")
+
+def _stop_auto_users(notification, strategy=None):
+    conn = get_db()
+    rows = conn.execute("SELECT id, strategy FROM users WHERE is_auto_trading = 1").fetchall()
+    to_stop, to_trim = [], []
+    for r in rows:
+        chosen = strategies.parse_list(r["strategy"])
+        if strategy is None: to_stop.append(r["id"])
+        elif strategy in chosen:
+            left = [x for x in chosen if x != strategy]
+            if left: to_trim.append((r["id"], ",".join(left)))
+            else: to_stop.append(r["id"])
+    if to_stop:
+        marks = ",".join("?" for _ in to_stop)
+        conn.execute(f"UPDATE users SET is_auto_trading = 0, settings_locked = 0, start_balance = NULL, last_notification = ?, balance_version = balance_version + 1 WHERE id IN ({marks})", (notification, *to_stop))
+    for uid, left in to_trim: conn.execute("UPDATE users SET strategy = ?, last_notification = ?, balance_version = balance_version + 1 WHERE id = ?", (left, f"⚠️ أوقف المدير استراتيجية «{strategies.name_of(strategy)}».\nيستمر حسابك بالاستراتيجيات الأخرى التي اخترتها.", uid))
+    conn.commit()
+    conn.close()
+    for uid in to_stop + [u for u, _ in to_trim]: clear_user_cache(uid)
+    return len(to_stop) + len(to_trim)
+
+def _stop_all_users(notification):
+    conn = get_db()
+    ids = [r["id"] for r in conn.execute("SELECT id FROM users WHERE is_copying = 1 OR is_auto_trading = 1").fetchall()]
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        conn.execute(f"UPDATE users SET is_copying = 0, is_auto_trading = 0, settings_locked = 0, start_balance = NULL, last_notification = ?, balance_version = balance_version + 1 WHERE id IN ({marks})", (notification, *ids))
+        conn.commit()
+    conn.close()
+    for uid in ids: clear_user_cache(uid)
+    return len(ids)
+
+def _set_rest(enabled):
+    set_setting("quotex_rest", "1" if enabled else "0")
+    if enabled: return _stop_all_users("🛠️ السيرفر في وضع الراحة مؤقتاً. أُوقف التداول وسيُعاد فتحه من المدير لاحقاً.")
+    return 0
+
+@app.route("/admin/toggle_rest", methods=["POST"])
+@admin_required
+def admin_toggle_rest():
+    enable = get_setting("quotex_rest", "0") != "1"
+    n = _set_rest(enable)
+    if enable: flash(f"🛠️ تم تفعيل وضع الراحة — أُوقف {n} مستخدم ولن يتصل السيرفر بـ Quotex", "success")
+    else: flash("✅ انتهى وضع الراحة — يمكن للمستخدمين التشغيل من جديد", "success")
+    return _back("status")
+
+@app.route("/api/admin/set_rest", methods=["POST"])
+@admin_api
+def api_admin_set_rest():
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    n = _set_rest(enabled)
+    return jsonify({"ok": True, "rest_mode": enabled, "stopped": n})
+
+MAX_BG_BYTES = 1_500_000
+
+@app.route("/admin/set_background", methods=["POST"])
+@admin_required
+def admin_set_background():
+    import base64
+    f = request.files.get("image")
+    if not f: flash("اختر صورة أولاً", "error"); return _back("appearance")
+    data = f.read()
+    if len(data) > MAX_BG_BYTES: flash("الصورة كبيرة جداً (الحد 1.5 ميغابايت). صغّرها ثم أعد المحاولة", "error"); return _back("appearance")
+    if data[:3] == b"\xff\xd8\xff": mime = "image/jpeg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n": mime = "image/png"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP": mime = "image/webp"
+    else: flash("الملف ليس صورة صالحة (JPG أو PNG أو WEBP)", "error"); return _back("appearance")
+    set_setting("app_background", f"data:{mime};base64," + base64.b64encode(data).decode())
+    set_setting("app_background_version", str(int(time.time())))
+    flash("✅ تم تعيين الخلفية وستظهر في تطبيق المستخدمين", "success")
+    return _back("appearance")
+
+@app.route("/admin/clear_background", methods=["POST"])
+@admin_required
+def admin_clear_background():
+    set_setting("app_background", "")
+    set_setting("app_background_version", str(int(time.time())))
+    flash("تم حذف الخلفية", "success")
+    return _back("appearance")
+
+@app.route("/admin/background_preview")
+@admin_required
+def admin_background_preview():
+    import base64
+    raw = get_setting("app_background", "")
+    if not raw or "," not in raw: return ("", 404)
+    head, b64 = raw.split(",", 1)
+    return Response(base64.b64decode(b64), mimetype=head.split(";")[0].replace("data:", ""))
+
+@app.route("/admin/toggle_strategy", methods=["POST"])
+@admin_required
+def admin_toggle_strategy():
+    sid = request.values.get("strategy", "")
+    if not strategies.is_valid(sid): flash("استراتيجية غير معروفة", "error"); return _back("strategies")
+    new_val = "0" if strategies.is_enabled(sid) else "1"
+    set_setting(f"strategy_enabled_{sid}", new_val)
+    name = strategies.name_of(sid)
+    if new_val == "0":
+        n = _stop_auto_users(f"⚠️ أوقف المدير استراتيجية «{name}». اختر استراتيجية أخرى ثم شغّل من جديد.", sid)
+        flash(f"⛔ تم تعطيل «{name}» — أُوقف {n} مستخدم وأُبلغوا", "success")
+    else: flash(f"✅ تم تفعيل «{name}»", "success")
+    return _back("strategies")
+
+@app.route("/admin/toggle_auto_trading", methods=["POST"])
+@admin_required
+def admin_toggle_auto_trading():
+    current = get_setting("admin_auto_enabled", "1")
+    new_val = "0" if current == "1" else "1"
+    set_setting("admin_auto_enabled", new_val)
+    if new_val == "0":
+        n = _stop_auto_users("⚠️ تم إيقاف التداول الآلي من قبل المدير. يمكنك تشغيله من جديد عند إعادة تفعيله.")
+        flash(f"⛔ تم تعطيل التداول الآلي — أُوقف {n} مستخدم وأُبلغوا", "success")
+    else: flash("✅ تم تفعيل التداول الآلي — يمكن للمستخدمين التفعيل من جديد", "success")
+    return _back("status")
+
+@app.route("/admin/toggle_telegram_bot", methods=["POST"])
+@admin_required
+def admin_toggle_telegram_bot():
+    current = get_setting("admin_bot_enabled", "1")
+    new_val = "0" if current == "1" else "1"
+    set_setting("admin_bot_enabled", new_val)
+    if new_val == "0": flash("⛔ تم تعطيل بوت تيليجرام — لن تُرسل إشارات للقناة", "success")
+    else: flash("✅ تم تفعيل بوت تيليجرام", "success")
+    return _back("status")
+
+@app.route("/admin/test_telegram", methods=["POST"])
+@admin_required
+def admin_test_telegram():
+    ok, info = send_telegram_text("✅ رسالة اختبار من لوحة Oscar Trader AI — الربط يعمل بشكل صحيح.")
+    if ok: flash("✅ وصلت رسالة الاختبار إلى تيليجرام", "success")
+    else: flash(f"❌ فشل الإرسال: {info}", "error")
+    return _back("status")
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("is_admin", None)
+    return redirect(url_for("admin"))
+
+if __name__ == "__main__":
+    copy_manager.start_background_loop()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
+
+import logging
+import threading
+import sys
+import faulthandler
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", handlers=[logging.FileHandler("server_health.log", encoding="utf-8"), logging.StreamHandler()])
+logger = logging.getLogger("OscarServer")
+faulthandler.enable()
+
+SERVER_START_TIME = time.time()
+SERVER_HEALTH = {"status": "running", "errors": 0, "started_at": SERVER_START_TIME}
+
+def oscar_health_check():
+    while True:
+        try:
+            uptime = int(time.time() - SERVER_START_TIME)
+            logger.info("Server health OK | Uptime: %s seconds", uptime)
+            time.sleep(60)
+        except Exception:
+            SERVER_HEALTH["errors"] += 1
+            logger.exception("Health check error")
+            time.sleep(10)
+
+def oscar_safe_execute(function, *args, **kwargs):
+    try: return function(*args, **kwargs)
+    except Exception:
+        SERVER_HEALTH["errors"] += 1
+        logger.exception("Execution error")
+        raise
+
+def oscar_start_monitor():
+    thread = threading.Thread(target=oscar_health_check, daemon=True, name="OscarHealthMonitor")
+    thread.start()
+    logger.info("Oscar stability monitor started")
+
+oscar_start_monitor()
